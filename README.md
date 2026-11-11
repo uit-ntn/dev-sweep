@@ -48,7 +48,7 @@ The following items are **planned**, not a statement of currently shipped functi
 
 ### Core scanning
 
-- [x] Select one or more folders or drives to scan.
+- [x] Select one or more folders to scan (whole drive roots and the home folder itself are refused for safety).
 - [x] Detect common developer-generated directories using built-in rules.
 - [x] Show total estimated reclaimable bytes and per-item sizes.
 - [x] Filter by ecosystem, path, file type, size, and risk level.
