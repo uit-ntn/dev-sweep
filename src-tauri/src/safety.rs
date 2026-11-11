@@ -49,6 +49,17 @@ pub fn device_id(meta: &Metadata) -> Option<u64> {
 pub struct DirIdentity {
     pub a: u64,
     pub b: u64,
+    /// Creation (birth) time in nanoseconds where the platform reports it.
+    /// Guards against inode reuse on Unix after delete + recreate.
+    pub created: u64,
+}
+
+fn created_nanos(meta: &Metadata) -> u64 {
+    meta.created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 pub fn dir_identity(path: &Path, meta: &Metadata) -> DirIdentity {
@@ -59,6 +70,7 @@ pub fn dir_identity(path: &Path, meta: &Metadata) -> DirIdentity {
         DirIdentity {
             a: meta.dev(),
             b: meta.ino(),
+            created: created_nanos(meta),
         }
     }
     #[cfg(windows)]
@@ -66,29 +78,25 @@ pub fn dir_identity(path: &Path, meta: &Metadata) -> DirIdentity {
         // Prefer the NTFS volume serial + file index, which changes whenever
         // the folder is deleted and recreated. Fall back to the creation
         // timestamp if the handle cannot be opened.
-        windows_file_id(path).unwrap_or_else(|| {
-            use std::os::windows::fs::MetadataExt;
-            DirIdentity {
-                a: meta.creation_time(),
-                b: u64::MAX,
-            }
+        windows_file_id(path, meta).unwrap_or_else(|| DirIdentity {
+            a: 0,
+            b: u64::MAX,
+            created: created_nanos(meta),
         })
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
-        let created = meta
-            .created()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        DirIdentity { a: created, b: 0 }
+        DirIdentity {
+            a: 0,
+            b: 0,
+            created: created_nanos(meta),
+        }
     }
 }
 
 #[cfg(windows)]
-fn windows_file_id(path: &Path) -> Option<DirIdentity> {
+fn windows_file_id(path: &Path, meta: &Metadata) -> Option<DirIdentity> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -113,6 +121,7 @@ fn windows_file_id(path: &Path) -> Option<DirIdentity> {
     Some(DirIdentity {
         a: info.dwVolumeSerialNumber as u64,
         b: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        created: created_nanos(meta),
     })
 }
 

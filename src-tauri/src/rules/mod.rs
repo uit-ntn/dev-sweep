@@ -36,7 +36,6 @@ pub struct MatchContext<'a> {
     pub parent: &'a Path,
 }
 
-#[derive(Debug)]
 pub struct Rule {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -51,6 +50,12 @@ pub struct Rule {
     /// Human-readable description of the context check, shown in the UI.
     pub context_hint: &'static str,
     pub verify: fn(&MatchContext) -> bool,
+}
+
+impl std::fmt::Debug for Rule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rule").field("id", &self.id).finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
