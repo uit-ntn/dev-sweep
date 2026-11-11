@@ -20,20 +20,21 @@ export function Dashboard() {
   const startScan = useSweepStore((s) => s.startScan);
   const setPage = useSweepStore((s) => s.setPage);
 
-  const total = candidates.reduce((sum, c) => sum + c.sizeBytes, 0);
+  const cleanable = candidates.filter((c) => c.blockedReason == null);
+  const total = cleanable.reduce((sum, c) => sum + c.sizeBytes, 0);
   const lastScan = history.find((h) => h.kind === "scan");
   const reclaimed = history.filter((h) => h.kind === "cleanup").reduce((s, h) => s + h.bytes, 0);
 
   const byEcosystem = useMemo(() => {
     const m = new Map<string, { bytes: number; count: number }>();
-    for (const c of candidates) {
+    for (const c of cleanable) {
       const cur = m.get(c.ecosystem) ?? { bytes: 0, count: 0 };
       cur.bytes += c.sizeBytes;
       cur.count += 1;
       m.set(c.ecosystem, cur);
     }
     return [...m.entries()].sort((a, b) => b[1].bytes - a[1].bytes);
-  }, [candidates]);
+  }, [cleanable]);
   const maxBytes = byEcosystem[0]?.[1].bytes ?? 0;
 
   async function scan() {
@@ -57,7 +58,11 @@ export function Dashboard() {
         <Stat
           label="Reclaimable (estimate)"
           value={formatBytes(total)}
-          hint={summary ? `${candidates.length} items found` : "Run a scan to see"}
+          hint={
+            summary
+              ? `${cleanable.length} cleanable items · logical size at scan time${summary.incomplete ? " · incomplete" : ""}`
+              : "Run a scan to see"
+          }
         />
         <Stat label="Scan roots" value={roots.length} hint="Folders you chose" />
         <Stat
@@ -65,7 +70,11 @@ export function Dashboard() {
           value={lastScan ? new Date(lastScan.at).toLocaleDateString() : "—"}
           hint={summary ? `${summary.dirsVisited.toLocaleString()} folders in ${formatDuration(summary.elapsedMs)}` : undefined}
         />
-        <Stat label="Moved to Trash" value={formatBytes(reclaimed)} hint="All time, this device" />
+        <Stat
+          label="Est. moved to Trash"
+          value={formatBytes(reclaimed)}
+          hint="Logical size, all time, this device — not measured free space"
+        />
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">

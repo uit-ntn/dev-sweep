@@ -5,6 +5,7 @@ import { useSweepStore, type Theme } from "../stores/useSweepStore";
 
 export function Settings() {
   const exclusions = useSweepStore((s) => s.exclusions);
+  const exclusionError = useSweepStore((s) => s.exclusionError);
   const addExclusions = useSweepStore((s) => s.addExclusions);
   const removeExclusion = useSweepStore((s) => s.removeExclusion);
   const theme = useSweepStore((s) => s.theme);
@@ -17,7 +18,7 @@ export function Settings() {
   async function addExclusion() {
     try {
       const picked = await pickFolders();
-      if (picked.length) addExclusions(picked);
+      if (picked.length) await addExclusions(picked);
     } catch (e) {
       setError(String(e));
     }
@@ -29,7 +30,11 @@ export function Settings() {
 
       <Card>
         <h2 className="mb-1 font-semibold">Excluded folders</h2>
-        <p className="mb-3 text-sm text-muted">Scans never enter these folders or anything below them.</p>
+        <p className="mb-3 text-sm text-muted">
+          Scans never enter these folders, and no folder that contains one of them can be cleaned. The list is stored
+          by the app backend and enforced again right before every cleanup. Changing it invalidates the current scan
+          results.
+        </p>
         {exclusions.length === 0 ? (
           <p className="mb-3 text-sm text-muted">No exclusions.</p>
         ) : (
@@ -39,7 +44,7 @@ export function Settings() {
                 <span className="min-w-0 flex-1 truncate font-mono text-xs" title={e}>
                   {e}
                 </span>
-                <Button variant="ghost" onClick={() => removeExclusion(e)}>
+                <Button variant="ghost" onClick={() => void removeExclusion(e)}>
                   Remove
                 </Button>
               </li>
@@ -49,9 +54,9 @@ export function Settings() {
         <Button onClick={addExclusion} disabled={!inTauri()}>
           + Exclude folder
         </Button>
-        {error && (
+        {(error || exclusionError) && (
           <div className="mt-3">
-            <Notice tone="error">{error}</Notice>
+            <Notice tone="error">{error ?? exclusionError}</Notice>
           </div>
         )}
       </Card>
@@ -114,7 +119,8 @@ export function Settings() {
       <Card>
         <h2 className="mb-1 font-semibold">Local history</h2>
         <p className="mb-3 text-sm text-muted">
-          {history.length} entries. Only dates, item counts and sizes are kept — never paths or file names.
+          {history.length} entries. Only dates, item counts and estimated sizes are kept — never paths or file names.
+          Disk Analyzer snapshots are managed on the Disk Analyzer page.
         </p>
         <Button onClick={clearHistory} disabled={history.length === 0}>
           Clear history

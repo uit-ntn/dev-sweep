@@ -231,6 +231,65 @@ pub fn is_filesystem_root(path: &Path) -> bool {
     path.parent().is_none()
 }
 
+/// Comparison key for a path: one entry per component, with Windows verbatim
+/// prefixes (`\\?\C:` vs `C:`) unified and case folded on Windows. `..` is
+/// resolved lexically. Use with [`is_within`] instead of `Path::starts_with`
+/// whenever the two paths may not come from the same `canonicalize` call.
+pub fn path_key(p: &Path) -> Vec<String> {
+    use std::path::{Component, Prefix};
+    fn fold(s: &str) -> String {
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut anchored = 0usize; // number of leading prefix/root entries
+    for c in p.components() {
+        match c {
+            Component::Prefix(pre) => {
+                let s = match pre.kind() {
+                    Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                        format!("{}:", (d as char).to_ascii_lowercase())
+                    }
+                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+                        r"\\{}\{}",
+                        server.to_string_lossy(),
+                        share.to_string_lossy()
+                    )
+                    .to_lowercase(),
+                    _ => fold(&pre.as_os_str().to_string_lossy()),
+                };
+                out.push(s);
+                anchored += 1;
+            }
+            Component::RootDir => {
+                out.push("/".into());
+                anchored += 1;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.len() > anchored {
+                    out.pop();
+                }
+            }
+            Component::Normal(n) => out.push(fold(&n.to_string_lossy())),
+        }
+    }
+    out
+}
+
+/// `child` equals `ancestor` or lies below it (component-wise, see [`path_key`]).
+pub fn is_within(child: &Path, ancestor: &Path) -> bool {
+    path_key(child).starts_with(&path_key(ancestor))
+}
+
+/// Same as [`is_within`] but with precomputed keys.
+pub fn key_within(child: &[String], ancestor: &[String]) -> bool {
+    child.starts_with(ancestor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +311,23 @@ mod tests {
             let child = home.join("some-projects-folder");
             assert!(p.check(&child).is_ok());
         }
+    }
+
+    #[test]
+    fn path_keys_compare_by_component() {
+        assert!(is_within(Path::new("/a/dist/keep"), Path::new("/a/dist")));
+        assert!(is_within(Path::new("/a/dist"), Path::new("/a/dist")));
+        // String prefix is not a path prefix.
+        assert!(!is_within(Path::new("/a/distribution"), Path::new("/a/dist")));
+        assert!(is_within(Path::new("/a/b/../dist/x"), Path::new("/a/dist")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_keys_ignore_verbatim_prefix_and_case() {
+        assert!(is_within(Path::new(r"\\?\C:\Work\App\dist"), Path::new(r"c:\work\app")));
+        assert!(is_within(Path::new(r"C:\work\app\DIST\keep"), Path::new(r"\\?\C:\Work\App\dist")));
+        assert!(!is_within(Path::new(r"D:\work\app"), Path::new(r"C:\work")));
     }
 
     #[test]

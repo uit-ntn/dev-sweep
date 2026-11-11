@@ -135,15 +135,50 @@ DevSweep is a **destructive-action utility**: its safety model is a product requ
 > [!CAUTION]
 > Recreating dependencies or build output can require network access, time, storage, original lockfiles, and valid toolchains. Some generated folders can contain unique local modifications. **Always inspect the results and keep backups of important work.**
 
-## Proposed interface
+## Interface
 
-The eventual UI is envisioned as three simple views:
+- **Dashboard:** scan roots, estimated reclaimable size, last scan, ecosystem breakdown and aggregate history.
+- **Scanner:** live scan progress, match list, ecosystem/risk/size filters, path details, size and risk indicators.
+- **Cleanup review:** checked items, estimated size, exact operation, per-item confirmation for *Caution* items, a final confirmation, and per-item results.
+- **Disk Analyzer (Windows):** read-only view of a whole drive, with drill-down, largest files and snapshot comparison (see below).
+- **Settings:** exclusions, theme, rule catalogue, local history.
 
-- **Dashboard:** storage summary, scan roots, last scan, and cleanup statistics.
-- **Scanner:** live scan progress, match list, ecosystem filters, path details, size and risk indicators.
-- **Cleanup review:** checked items, estimated space, exact operation, confirmation, and per-item results.
+### Using the workspace cleaner
 
-Additional settings can include exclusions, custom detection rules, preferred cleanup behavior, and language/theme preferences.
+1. Add one or more project folders on the Dashboard. Drive roots (`C:\`), your home folder itself and system folders are refused.
+2. Add exclusions in Settings if needed. Exclusions are stored by the backend (in the app config folder) and enforced in two places: scans never enter an excluded folder, and **no folder that contains an excluded folder can be cleaned** — e.g. excluding `app/dist/keep` makes `app/dist` *Not cleanable*. Changing exclusions invalidates the current results; scan again before cleaning.
+3. Run a scan and select items. **Select all visible** only selects *Low* and *Review* items; *Caution* items (ambiguous `dist`/`build`, `.ipynb_checkpoints`, Gradle folders) must be ticked one by one and confirmed individually on the review screen, otherwise they are skipped.
+4. Review and confirm. Items are moved to the Recycle Bin.
+
+**About sizes.** The size shown for an item is the sum of logical file sizes *at scan time* — an estimate. After cleanup DevSweep reports the *estimated size moved to Trash*. It only reports a change in free space when Windows measured one for the drive, and that number includes everything else happening on the drive. Items in the Recycle Bin still use space until it is emptied. Sizes marked `≥` and scans marked *incomplete* hit unreadable entries or were cancelled.
+
+### Disk Analyzer
+
+1. Open **Disk Analyzer**, pick a local drive (C:, D:, …) and click **Analyze**. Progress is shown and the analysis can be cancelled.
+2. Browse the largest folders at each level, drill down, and go back with the breadcrumb. The side list shows the largest files in the current folder (taken from the 1,000 largest files on the drive).
+3. **Open in Explorer** opens a folder or selects a file. The backend resolves the path from its own analysis tree and re-checks it; the UI never passes a path.
+4. **Scan for cleanable items** on a sub-folder hands it to the normal workspace flow (root validation, exclusions, review, confirmation). The Disk Analyzer itself has **no delete action**, and its results cannot be passed to the cleanup command.
+
+The analysis runs with your normal permissions and never asks for administrator rights. Folders it cannot read are skipped and counted, and the result is marked incomplete. Symlinks, junctions, other reparse points and volumes mounted into folders are not followed. Hard-linked files are counted once per link.
+
+### Snapshots and growth over time
+
+After each **completed** analysis (not cancelled) a snapshot is saved locally in the app data folder: volume serial and root, time, free space reported by Windows, the size of every folder at most two levels deep plus every folder of 32 MiB or more (up to 20,000), and the list of unreadable folders. The newest 30 snapshots are kept, and you can delete one or all of them on the **Snapshots & growth** tab.
+
+Pick two snapshots of the **same drive** to compare. You see:
+
+- the change in **used space measured by Windows** and the real time between the two scans (e.g. *Grew 12 GB in 2 days*);
+- separately, the change in **logical size of readable folders**, and the folders that grew or shrank the most.
+
+A comparison is marked **partial** when either scan had unreadable folders, the unreadable set differs, a folder limit was hit, or the scans used different detail settings. Folders inside an unreadable area are left out rather than shown as deleted. Snapshots of different drives cannot be compared. Scans are manual only: there is no scheduler, no telemetry and nothing leaves the machine.
+
+### Known limitations
+
+- The Rust backend and the Disk Analyzer have not yet been tested end-to-end on a real Windows machine.
+- Drive listing and free-space measurement are Windows-only; on other platforms the Disk Analyzer shows no drives.
+- The analyzer keeps the folder tree in memory (capped at 5 million folders); very large drives use a few hundred MB of RAM while browsing.
+- Sizes are logical sizes, not allocated size on disk (compression, sparse files and cluster slack are not accounted for).
+- Directory identity on Windows uses the NTFS file index; on file systems without stable file ids it falls back to creation time.
 
 *Screenshots and demos will be added once a working UI exists.*
 
@@ -257,30 +292,42 @@ npm install
 npm run tauri dev
 ```
 
-Run the Rust test suite (uses temporary-directory fixtures only, and a fake remover — it never touches the real Trash):
+Run the tests (Rust tests use temporary-directory fixtures and a fake remover — they never touch the real Trash or your drives):
 
 ```bash
+npm run typecheck
+npm test                 # frontend store tests (Vitest)
 cd src-tauri
 cargo test
+cargo clippy --all-targets
 ```
 
 ### Project layout
 
 ```text
 src/                     React UI
-  pages/                 Dashboard, Scanner, CleanupReview, Settings
-  stores/useSweepStore   Zustand store (roots, scan, filters, selection, history)
+  pages/                 Dashboard, Scanner, CleanupReview, DiskAnalyzer, Settings
+  stores/useSweepStore   Workspace state (roots, scan, filters, selection, history)
+  stores/useDiskStore    Disk Analyzer state (volumes, analysis, snapshots)
   lib/api.ts             Typed wrappers around Tauri commands
 src-tauri/src/
   rules/                 Built-in detection rules + project-context checks
   scanner/               Cancellable traversal, sizing, progress events
   cleaner/               Revalidation + Trash-first cleanup
-  safety.rs              Protected paths, link/junction detection, dir identity
-  commands.rs            Tauri commands: list_rules, validate_root,
-                         start_scan, cancel_scan, clean_items
+  workspace.rs           Scan sessions and scan/cleanup locking
+  exclusions.rs          Backend-owned, persisted exclusion policy
+  disk_usage.rs          Read-only drive analysis, volumes, Explorer reveal
+  snapshots.rs           Local snapshots and comparisons
+  safety.rs              Protected paths, link/junction detection, path keys, dir identity
+  commands.rs            Tauri commands for both flows
 ```
 
-**Safety design in the code:** the UI never sends a path to delete — only opaque ids issued by the most recent scan. Before each item is moved to the Trash the backend re-checks that it still exists, is not a link/junction, has the same identity (NTFS file index / inode + birth time), resolves to the same canonical path, sits strictly inside its scan root, is not protected, and still matches its rule. Anything that fails is reported as *Skipped*.
+**Safety design in the code:**
+
+- The UI never sends a path to delete — only ids of the form `<session>:c<n>` from the current scan session. A cleanup naming an older session is rejected, and results only update the session that owns them.
+- Scans and cleanups are serialized in the backend (`workspace.rs`); a conflicting request is rejected even if the UI has not caught up.
+- Before each item is moved to the Trash the backend re-checks that it still exists, is not a link/junction, has the same identity (NTFS file index / inode + birth time), resolves to the same canonical path, sits strictly inside its scan root, is not protected, does not contain or sit inside an excluded folder (component-wise, case-insensitive on Windows), still matches its rule, and — for *Caution* items — was individually confirmed. Anything that fails is reported as *Skipped*.
+- Disk Analyzer commands accept only a drive returned by `list_volumes` and return numeric node indices that the cleanup command does not accept.
 
 ### Frontend-only development (when applicable)
 

@@ -3,6 +3,7 @@ import { Sidebar } from "./components/Sidebar";
 import { useScanProgress } from "./hooks/useScanProgress";
 import { CleanupReview } from "./pages/CleanupReview";
 import { Dashboard } from "./pages/Dashboard";
+import { DiskAnalyzer } from "./pages/DiskAnalyzer";
 import { Scanner } from "./pages/Scanner";
 import { Settings } from "./pages/Settings";
 import { useSweepStore } from "./stores/useSweepStore";
@@ -10,13 +11,13 @@ import { useSweepStore } from "./stores/useSweepStore";
 export default function App() {
   const page = useSweepStore((s) => s.page);
   const theme = useSweepStore((s) => s.theme);
-  const loadRules = useSweepStore((s) => s.loadRules);
+  const init = useSweepStore((s) => s.init);
 
   useScanProgress();
 
   useEffect(() => {
-    loadRules();
-  }, [loadRules]);
+    void init();
+  }, [init]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -31,6 +32,7 @@ export default function App() {
         {page === "dashboard" && <Dashboard />}
         {page === "scanner" && <Scanner />}
         {page === "review" && <CleanupReview />}
+        {page === "disk" && <DiskAnalyzer />}
         {page === "settings" && <Settings />}
       </main>
     </div>

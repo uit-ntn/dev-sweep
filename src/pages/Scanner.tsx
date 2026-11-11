@@ -1,7 +1,7 @@
 import { useMemo, type ReactNode } from "react";
 import { Button, Card, Empty, Notice, PageHeader, RiskBadge, riskLabel } from "../components/ui";
 import { formatAge, formatBytes, formatCount, formatDuration } from "../lib/format";
-import { filterAndSort, useSweepStore, type SortKey } from "../stores/useSweepStore";
+import { filterAndSort, isSelectable, useSweepStore, type SortKey } from "../stores/useSweepStore";
 import type { Candidate, Risk } from "../types";
 
 const RISKS: Risk[] = ["low", "review", "caution"];
@@ -42,8 +42,12 @@ export function Scanner() {
   );
   const inspected = s.liveCandidates.find((c) => c.id === s.inspectedId) ?? null;
   const selectedBytes = s.liveCandidates.filter((c) => s.selected.has(c.id)).reduce((a, c) => a + c.sizeBytes, 0);
-  const allVisibleSelected = visible.length > 0 && visible.every((c) => s.selected.has(c.id));
-  const canSelect = !s.scanning;
+  // "Select all visible" only ever covers bulk-selectable items: Caution and
+  // blocked items must be ticked one by one.
+  const bulkVisible = visible.filter((c) => c.bulkSelectable && isSelectable(c));
+  const allVisibleSelected = bulkVisible.length > 0 && bulkVisible.every((c) => s.selected.has(c.id));
+  const excludedFromBulk = visible.length - bulkVisible.length;
+  const canSelect = !s.scanning && !s.summaryStale;
 
   return (
     <div className="flex h-full flex-col">
@@ -61,7 +65,7 @@ export function Scanner() {
                 {s.summary ? "Rescan" : "Start scan"}
               </Button>
               <Button variant="primary" disabled={s.selected.size === 0} onClick={() => s.setPage("review")}>
-                Review {s.selected.size || ""} selected · {formatBytes(selectedBytes)}
+                Review {s.selected.size || ""} selected · ~{formatBytes(selectedBytes)}
               </Button>
             </>
           )
@@ -140,16 +144,23 @@ export function Scanner() {
                   <th className="w-8 px-3 py-2">
                     <input
                       type="checkbox"
-                      aria-label="Select all visible"
-                      disabled={!canSelect}
+                      aria-label="Select all visible items that allow bulk selection"
+                      title={
+                        excludedFromBulk > 0
+                          ? `${excludedFromBulk} Caution or blocked items are never selected in bulk`
+                          : "Select all visible"
+                      }
+                      disabled={!canSelect || bulkVisible.length === 0}
                       checked={allVisibleSelected}
-                      onChange={(e) => s.setSelected(visible.map((c) => c.id), e.target.checked)}
+                      onChange={(e) => s.selectBulk(visible, e.target.checked)}
                     />
                   </th>
                   <th className="py-2 font-medium">Item</th>
                   <th className="py-2 font-medium">Risk</th>
                   <th className="py-2 text-right font-medium">Modified</th>
-                  <th className="px-3 py-2 text-right font-medium">Size</th>
+                  <th className="px-3 py-2 text-right font-medium" title="Logical size at scan time">
+                    Est. size
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
@@ -180,13 +191,19 @@ function Row({ c, canSelect }: { c: Candidate; canSelect: boolean }) {
         <input
           type="checkbox"
           aria-label={`Select ${c.path}`}
-          disabled={!canSelect}
+          title={c.blockedReason ?? (c.bulkSelectable ? undefined : "Caution: select individually")}
+          disabled={!canSelect || !isSelectable(c)}
           checked={selected}
           onChange={() => toggleSelected(c.id)}
         />
       </td>
       <td className="max-w-0 py-2 pr-3">
-        <div className="font-medium">{c.displayName}</div>
+        <div className="flex flex-wrap items-center gap-2 font-medium">
+          {c.displayName}
+          {c.blockedReason && (
+            <span className="rounded bg-surface-2 px-1.5 py-0.5 text-xs font-normal text-muted">Not cleanable</span>
+          )}
+        </div>
         <div className="truncate font-mono text-xs text-muted" title={c.path}>
           {c.path}
         </div>
@@ -195,7 +212,13 @@ function Row({ c, canSelect }: { c: Candidate; canSelect: boolean }) {
         <RiskBadge risk={c.risk} />
       </td>
       <td className="whitespace-nowrap py-2 text-right text-muted">{formatAge(c.lastModified)}</td>
-      <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{formatBytes(c.sizeBytes)}</td>
+      <td
+        className="whitespace-nowrap px-3 py-2 text-right tabular-nums"
+        title={c.sizeComplete ? undefined : "Some entries could not be read; size is a lower bound"}
+      >
+        {c.sizeComplete ? "" : "≥ "}
+        {formatBytes(c.sizeBytes)}
+      </td>
     </tr>
   );
 }
@@ -223,7 +246,8 @@ function Inspector({ c }: { c: Candidate }) {
         <Field label="Risk">
           <RiskBadge risk={c.risk} />
         </Field>
-        <Field label="Size">
+        <Field label="Estimated size (logical, at scan time)">
+          {c.sizeComplete ? "" : "≥ "}
           {formatBytes(c.sizeBytes)} in {formatCount(c.fileCount)} files
         </Field>
         <Field label="Last modified">{formatAge(c.lastModified)}</Field>
@@ -237,6 +261,11 @@ function Inspector({ c }: { c: Candidate }) {
           <p className="text-xs text-muted">Matched because: {rule.context_hint}</p>
         </div>
       )}
+      {c.blockedReason && (
+        <div className="mt-3">
+          <Notice tone="warn">Cannot be cleaned: {c.blockedReason}.</Notice>
+        </div>
+      )}
       {c.unreadable > 0 && (
         <div className="mt-3">
           <Notice tone="warn">
@@ -246,10 +275,13 @@ function Inspector({ c }: { c: Candidate }) {
       )}
       {c.risk === "caution" && (
         <div className="mt-3">
-          <Notice tone="warn">This folder name is ambiguous or may contain unique data. Open it and check first.</Notice>
+          <Notice tone="warn">
+            This folder name is ambiguous or may contain unique data. Open it and check first. Caution items are never
+            included by "select all" and must be confirmed individually at review.
+          </Notice>
         </div>
       )}
-      <Button className="mt-4 w-full" onClick={() => addExclusions([c.path])}>
+      <Button className="mt-4 w-full" onClick={() => void addExclusions([c.path])}>
         Always exclude this folder
       </Button>
     </Card>
@@ -271,7 +303,16 @@ function ScanStatus() {
   const summary = useSweepStore((s) => s.summary);
   const error = useSweepStore((s) => s.scanError);
   const roots = useSweepStore((s) => s.roots);
+  const stale = useSweepStore((s) => s.summaryStale);
 
+  if (stale && !scanning)
+    return (
+      <div className="mb-3">
+        <Notice tone="warn">
+          Exclusions changed after this scan. These results can no longer be cleaned — scan again.
+        </Notice>
+      </div>
+    );
   if (error) return <div className="mb-3"><Notice tone="error">Scan failed: {error}</Notice></div>;
   if (!scanning && roots.length === 0)
     return (
@@ -297,11 +338,12 @@ function ScanStatus() {
   if (summary)
     return (
       <div className="mb-3">
-        <Notice tone={summary.cancelled ? "warn" : "info"}>
+        <Notice tone={summary.incomplete ? "warn" : "info"}>
           {summary.cancelled ? "Scan cancelled — results are partial. " : ""}
           Scanned {formatCount(summary.dirsVisited)} folders in {formatDuration(summary.elapsedMs)}; found{" "}
-          {summary.candidates.length} items ({formatBytes(summary.totalBytes)}).
-          {summary.errors > 0 && ` ${summary.errors} folders could not be read.`}
+          {summary.candidates.length} items, about {formatBytes(summary.totalBytes)} (logical size at scan time).
+          {summary.errors > 0 && ` ${summary.errors} folders could not be read, so items may be missing.`}
+          {!summary.cancelled && summary.incomplete && summary.errors === 0 && " Some sizes are lower bounds."}
         </Notice>
       </div>
     );

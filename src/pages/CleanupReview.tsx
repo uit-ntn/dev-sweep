@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Button, Card, Empty, Notice, PageHeader, RiskBadge } from "../components/ui";
-import { formatBytes, formatCount } from "../lib/format";
+import { formatBytes, formatCount, formatSignedBytes } from "../lib/format";
 import { useSweepStore } from "../stores/useSweepStore";
 import type { CleanStatus } from "../types";
 
@@ -18,14 +18,17 @@ const STATUS_LABEL: Record<CleanStatus, string> = {
 export function CleanupReview() {
   const candidates = useSweepStore((s) => s.liveCandidates);
   const selected = useSweepStore((s) => s.selected);
+  const acknowledged = useSweepStore((s) => s.acknowledged);
   const toggleSelected = useSweepStore((s) => s.toggleSelected);
+  const toggleAcknowledged = useSweepStore((s) => s.toggleAcknowledged);
   const cleaning = useSweepStore((s) => s.cleaning);
-  const results = useSweepStore((s) => s.cleanResults);
+  const report = useSweepStore((s) => s.cleanReport);
   const error = useSweepStore((s) => s.cleanError);
   const runCleanup = useSweepStore((s) => s.runCleanup);
   const resetCleanup = useSweepStore((s) => s.resetCleanup);
   const setPage = useSweepStore((s) => s.setPage);
   const scanning = useSweepStore((s) => s.scanning);
+  const stale = useSweepStore((s) => s.summaryStale);
   const [confirmed, setConfirmed] = useState(false);
 
   const items = useMemo(
@@ -34,42 +37,72 @@ export function CleanupReview() {
   );
   const totalBytes = items.reduce((s, c) => s + c.sizeBytes, 0);
   const totalFiles = items.reduce((s, c) => s + c.fileCount, 0);
-  const cautionCount = items.filter((c) => c.risk === "caution").length;
+  const caution = items.filter((c) => c.risk === "caution");
+  const unconfirmedCaution = caution.filter((c) => !acknowledged.has(c.id)).length;
+  const anyIncomplete = items.some((c) => !c.sizeComplete);
 
-  if (results) {
+  if (report) {
     const counts = { trashed: 0, skipped: 0, failed: 0 };
-    let freed = 0;
-    for (const r of results) {
+    let moved = 0;
+    for (const r of report.results) {
       counts[r.status]++;
-      if (r.status === "trashed") freed += r.sizeBytes;
+      if (r.status === "trashed") moved += r.sizeBytes;
     }
     return (
       <div>
         <PageHeader
           title="Cleanup results"
-          subtitle={`${counts.trashed} moved to Trash (${formatBytes(freed)}), ${counts.skipped} skipped, ${counts.failed} failed.`}
+          subtitle={`${counts.trashed} moved to Trash, ${counts.skipped} skipped, ${counts.failed} failed.`}
           actions={
-            <>
-              <Button onClick={() => { resetCleanup(); setConfirmed(false); setPage("scanner"); }}>Back to results</Button>
-            </>
+            <Button
+              onClick={() => {
+                resetCleanup();
+                setConfirmed(false);
+                setPage("scanner");
+              }}
+            >
+              Back to results
+            </Button>
           }
         />
-        <Notice>
-          Items were moved to the Recycle Bin / Trash. Restoring them is usually possible from there, but not
-          guaranteed (e.g. on some removable or network drives). Freed space appears once the Trash is emptied.
-        </Notice>
-        <Card className="mt-4 p-0">
+        <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Card>
+            <div className="text-xs uppercase tracking-wide text-muted">Estimated size moved to Trash</div>
+            <div className="mt-1 text-2xl font-semibold tabular-nums">{formatBytes(moved)}</div>
+            <div className="mt-1 text-xs text-muted">Logical size measured at scan time, not space freed.</div>
+          </Card>
+          <Card>
+            <div className="text-xs uppercase tracking-wide text-muted">Free space (measured by Windows)</div>
+            {report.freeSpace.length === 0 ? (
+              <div className="mt-1 text-sm text-muted">Not measured on this platform.</div>
+            ) : (
+              <ul className="mt-1 space-y-1 text-sm">
+                {report.freeSpace.map((v) => (
+                  <li key={v.volume} className="tabular-nums">
+                    <span className="font-medium">{v.volume}</span> {formatBytes(v.freeBefore)} →{" "}
+                    {formatBytes(v.freeAfter)} ({formatSignedBytes(v.freeAfter - v.freeBefore)})
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="mt-1 text-xs text-muted">
+              Items in the Recycle Bin still use disk space until it is emptied, and other programs change free space
+              too.
+            </div>
+          </Card>
+        </div>
+        <Card className="p-0">
           <table className="w-full text-sm">
             <thead className="text-left text-xs text-muted">
               <tr className="border-b border-border">
                 <th className="px-3 py-2 font-medium">Status</th>
                 <th className="py-2 font-medium">Path</th>
                 <th className="py-2 font-medium">Details</th>
-                <th className="px-3 py-2 text-right font-medium">Size</th>
+                <th className="px-3 py-2 text-right font-medium">Est. size</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {results.map((r) => (
+              {report.results.map((r) => (
                 <tr key={r.id}>
                   <td className={`whitespace-nowrap px-3 py-2 font-medium ${STATUS_STYLE[r.status]}`}>
                     {STATUS_LABEL[r.status]}
@@ -109,14 +142,23 @@ export function CleanupReview() {
         </Card>
       ) : (
         <div className="space-y-4">
+          {stale && (
+            <Notice tone="error">
+              Exclusions changed after this scan, so these results can no longer be cleaned. Scan again.
+            </Notice>
+          )}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <Card>
               <div className="text-xs uppercase tracking-wide text-muted">Selected</div>
               <div className="mt-1 text-2xl font-semibold tabular-nums">{items.length}</div>
             </Card>
             <Card>
-              <div className="text-xs uppercase tracking-wide text-muted">Estimated space</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">{formatBytes(totalBytes)}</div>
+              <div className="text-xs uppercase tracking-wide text-muted">Estimated size</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {anyIncomplete ? "≥ " : ""}
+                {formatBytes(totalBytes)}
+              </div>
+              <div className="text-xs text-muted">Logical size at scan time</div>
             </Card>
             <Card>
               <div className="text-xs uppercase tracking-wide text-muted">Operation</div>
@@ -125,11 +167,11 @@ export function CleanupReview() {
             </Card>
           </div>
 
-          {cautionCount > 0 && (
+          {caution.length > 0 && (
             <Notice tone="warn">
-              {cautionCount} selected item{cautionCount > 1 ? "s are" : " is"} marked <strong>Caution</strong>: the
-              name is ambiguous or the folder may contain unique work (e.g. notebook checkpoints). Make sure you have
-              inspected {cautionCount > 1 ? "them" : "it"}.
+              {caution.length} selected item{caution.length > 1 ? "s are" : " is"} marked <strong>Caution</strong>:
+              the name is ambiguous or the folder may hold the only copy of some work (e.g. notebook checkpoints).
+              Confirm each one below after inspecting it; unconfirmed Caution items are skipped.
             </Notice>
           )}
 
@@ -140,13 +182,13 @@ export function CleanupReview() {
                   <th className="w-8 px-3 py-2"></th>
                   <th className="py-2 font-medium">Item</th>
                   <th className="py-2 font-medium">Risk</th>
-                  <th className="px-3 py-2 text-right font-medium">Size</th>
+                  <th className="px-3 py-2 text-right font-medium">Est. size</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
                 {items.map((c) => (
                   <tr key={c.id}>
-                    <td className="px-3 py-2">
+                    <td className="px-3 py-2 align-top">
                       <input
                         type="checkbox"
                         checked
@@ -160,11 +202,26 @@ export function CleanupReview() {
                       <div className="truncate font-mono text-xs text-muted" title={c.path}>
                         {c.path}
                       </div>
+                      {c.risk === "caution" && (
+                        <label className="mt-1.5 flex items-start gap-2 text-xs">
+                          <input
+                            type="checkbox"
+                            className="mt-0.5"
+                            checked={acknowledged.has(c.id)}
+                            disabled={cleaning}
+                            onChange={() => toggleAcknowledged(c.id)}
+                          />
+                          <span>I opened this folder and confirm it contains nothing I need.</span>
+                        </label>
+                      )}
                     </td>
-                    <td className="py-2">
+                    <td className="py-2 align-top">
                       <RiskBadge risk={c.risk} />
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{formatBytes(c.sizeBytes)}</td>
+                    <td className="whitespace-nowrap px-3 py-2 text-right align-top tabular-nums">
+                      {c.sizeComplete ? "" : "≥ "}
+                      {formatBytes(c.sizeBytes)}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -174,9 +231,9 @@ export function CleanupReview() {
           <Card className="space-y-3">
             <Notice>
               Before each item is touched, DevSweep re-checks that it still exists, is not a link, is the same folder
-              that was scanned, sits inside your scan root and still matches its project rule. Anything that changed is
-              skipped. Recreating dependencies or build output may later need network access, time and a working
-              toolchain.
+              that was scanned, sits inside your scan root, does not contain or sit inside an excluded folder, and still
+              matches its project rule. Anything that changed is skipped. Recreating dependencies or build output may
+              later need network access, time and a working toolchain.
             </Notice>
             <label className="flex items-start gap-2 text-sm">
               <input
@@ -184,18 +241,24 @@ export function CleanupReview() {
                 className="mt-0.5"
                 checked={confirmed}
                 onChange={(e) => setConfirmed(e.target.checked)}
-                disabled={cleaning}
+                disabled={cleaning || stale}
               />
               <span>
-                I have reviewed these {items.length} items and want to move them ({formatBytes(totalBytes)}) to the
-                Trash.
+                I have reviewed these {items.length} items and want to move them (about {formatBytes(totalBytes)}) to
+                the Trash.
               </span>
             </label>
+            {unconfirmedCaution > 0 && (
+              <p className="text-xs text-review">
+                {unconfirmedCaution} Caution item{unconfirmedCaution > 1 ? "s are" : " is"} not confirmed and will be
+                skipped.
+              </p>
+            )}
             {error && <Notice tone="error">{error}</Notice>}
             <div className="flex gap-2">
               <Button
                 variant="danger"
-                disabled={!confirmed || cleaning || scanning}
+                disabled={!confirmed || cleaning || scanning || stale}
                 onClick={async () => {
                   await runCleanup();
                   setConfirmed(false);

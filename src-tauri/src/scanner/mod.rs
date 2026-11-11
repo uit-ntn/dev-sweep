@@ -9,8 +9,12 @@
 //! * symlinks, junctions and other reparse points are never followed;
 //! * on Unix, mount boundaries are not crossed;
 //! * a matched directory is not descended into, so matches never nest and
-//!   bytes are never double counted.
+//!   bytes are never double counted;
+//! * excluded folders are never entered, and a match that *contains* an
+//!   excluded folder is reported as blocked and gets no cleanup record;
+//! * candidate ids are namespaced by scan session (`<session>:c<n>`).
 
+use crate::exclusions::ExclusionPolicy;
 use crate::rules::{self, Category, Risk, Rule};
 use crate::safety::{self, DirIdentity, ProtectedPaths};
 use serde::{Deserialize, Serialize};
@@ -22,8 +26,6 @@ use std::time::{Duration, Instant, SystemTime};
 #[serde(rename_all = "camelCase")]
 pub struct ScanRequest {
     pub roots: Vec<String>,
-    #[serde(default)]
-    pub exclusions: Vec<String>,
 }
 
 /// A match as sent to the UI.
@@ -40,12 +42,20 @@ pub struct Candidate {
     pub ecosystem: &'static str,
     pub category: Category,
     pub risk: Risk,
+    /// Sum of logical file sizes at scan time — an estimate, not the space
+    /// that will be freed (hard links, compression, cluster slack, Trash).
     pub size_bytes: u64,
     pub file_count: u64,
     /// Entries that could not be read while sizing (size is then a lower bound).
     pub unreadable: u64,
+    /// False when sizing hit unreadable entries or was cancelled.
+    pub size_complete: bool,
     /// Latest modification time found in the tree, seconds since the epoch.
     pub last_modified: Option<u64>,
+    /// May be included by "select all". Caution items must be ticked singly.
+    pub bulk_selectable: bool,
+    /// Set when the item can never be cleaned (e.g. contains an exclusion).
+    pub blocked_reason: Option<String>,
 }
 
 /// Backend-only record kept for revalidation before cleanup.
@@ -60,6 +70,7 @@ pub struct CandidateRecord {
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanProgress {
+    pub session_id: String,
     pub dirs_visited: u64,
     pub candidates_found: u64,
     pub bytes_found: u64,
@@ -72,12 +83,19 @@ pub struct ScanProgress {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanSummary {
+    pub session_id: String,
     pub roots: Vec<String>,
+    pub exclusions: Vec<String>,
     pub candidates: Vec<Candidate>,
     pub dirs_visited: u64,
+    /// Folders that could not be listed during traversal.
     pub errors: u64,
+    /// Total estimated size of cleanable (non-blocked) candidates.
     pub total_bytes: u64,
     pub cancelled: bool,
+    /// Results may be missing items or under-report sizes (cancelled scan,
+    /// unreadable folders, or candidates whose sizing was incomplete).
+    pub incomplete: bool,
     pub elapsed_ms: u64,
 }
 
@@ -127,7 +145,8 @@ fn dedupe_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
 struct Scanner<'a, F: FnMut(ScanProgress)> {
     cancel: &'a AtomicBool,
     protected: &'a ProtectedPaths,
-    exclusions: Vec<PathBuf>,
+    exclusions: &'a ExclusionPolicy,
+    session_id: &'a str,
     on_progress: F,
     last_emit: Instant,
     progress: ScanProgress,
@@ -153,7 +172,7 @@ impl<'a, F: FnMut(ScanProgress)> Scanner<'a, F> {
     }
 
     fn is_excluded(&self, p: &Path) -> bool {
-        self.exclusions.iter().any(|e| p.starts_with(e))
+        self.exclusions.excludes(p)
     }
 
     fn scan_root(&mut self, root: &Path) {
@@ -222,7 +241,11 @@ impl<'a, F: FnMut(ScanProgress)> Scanner<'a, F> {
     fn add_candidate(&mut self, root: &Path, path: &Path, rule: &'static Rule, meta: &std::fs::Metadata) {
         let size = measure_dir(path, self.cancel);
         self.next_id += 1;
-        let id = format!("c{}", self.next_id);
+        let id = format!("{}:c{}", self.session_id, self.next_id);
+        let blocked_reason = self
+            .exclusions
+            .conflict(path)
+            .or_else(|| self.protected.check(path).err());
         let candidate = Candidate {
             id: id.clone(),
             path: safety::display_path(path),
@@ -240,19 +263,25 @@ impl<'a, F: FnMut(ScanProgress)> Scanner<'a, F> {
             size_bytes: size.bytes,
             file_count: size.files,
             unreadable: size.unreadable,
+            size_complete: size.unreadable == 0 && !size.cancelled,
             last_modified: size.latest_mtime,
+            bulk_selectable: rule.bulk_selectable() && blocked_reason.is_none(),
+            blocked_reason: blocked_reason.clone(),
         };
-        self.records.push((
-            id,
-            CandidateRecord {
-                path: path.to_path_buf(),
-                root: root.to_path_buf(),
-                rule,
-                identity: safety::dir_identity(path, meta),
-            },
-        ));
+        // Blocked candidates get no record, so no id can ever clean them.
+        if blocked_reason.is_none() {
+            self.records.push((
+                id,
+                CandidateRecord {
+                    path: path.to_path_buf(),
+                    root: root.to_path_buf(),
+                    rule,
+                    identity: safety::dir_identity(path, meta),
+                },
+            ));
+            self.progress.bytes_found += size.bytes;
+        }
         self.progress.candidates_found += 1;
-        self.progress.bytes_found += size.bytes;
         self.progress.new_candidates.push(candidate.clone());
         self.candidates.push(candidate);
         self.maybe_emit(false);
@@ -265,6 +294,7 @@ pub struct DirSize {
     pub files: u64,
     pub unreadable: u64,
     pub latest_mtime: Option<u64>,
+    pub cancelled: bool,
 }
 
 fn mtime_secs(meta: &std::fs::Metadata) -> Option<u64> {
@@ -281,6 +311,7 @@ pub fn measure_dir(dir: &Path, cancel: &AtomicBool) -> DirSize {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
+            out.cancelled = true;
             break;
         }
         let Ok(entries) = std::fs::read_dir(&d) else {
@@ -316,7 +347,9 @@ pub fn measure_dir(dir: &Path, cancel: &AtomicBool) -> DirSize {
 /// Run a scan. `on_progress` is called at most every [`PROGRESS_INTERVAL`]
 /// plus once at the end.
 pub fn scan<F: FnMut(ScanProgress)>(
+    session_id: &str,
     request: &ScanRequest,
+    exclusions: &ExclusionPolicy,
     protected: &ProtectedPaths,
     cancel: &AtomicBool,
     on_progress: F,
@@ -332,20 +365,17 @@ pub fn scan<F: FnMut(ScanProgress)>(
         .collect::<Result<Vec<_>, _>>()?;
     let roots = dedupe_roots(roots);
 
-    // Exclusions that cannot be resolved (e.g. deleted folders) are ignored.
-    let exclusions = request
-        .exclusions
-        .iter()
-        .filter_map(|e| Path::new(e.trim()).canonicalize().ok())
-        .collect();
-
     let mut scanner = Scanner {
         cancel,
         protected,
         exclusions,
+        session_id,
         on_progress,
         last_emit: Instant::now(),
-        progress: ScanProgress::default(),
+        progress: ScanProgress {
+            session_id: session_id.to_string(),
+            ..ScanProgress::default()
+        },
         candidates: Vec::new(),
         records: Vec::new(),
         next_id: 0,
@@ -366,16 +396,25 @@ pub fn scan<F: FnMut(ScanProgress)>(
     let cancelled = scanner.cancelled();
     let mut candidates = scanner.candidates;
     candidates.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-    let total_bytes = candidates.iter().map(|c| c.size_bytes).sum();
+    let total_bytes = candidates
+        .iter()
+        .filter(|c| c.blocked_reason.is_none())
+        .map(|c| c.size_bytes)
+        .sum();
+    let incomplete =
+        cancelled || scanner.progress.errors > 0 || candidates.iter().any(|c| !c.size_complete);
 
     Ok(ScanOutput {
         summary: ScanSummary {
+            session_id: session_id.to_string(),
             roots: roots.iter().map(|r| safety::display_path(r)).collect(),
+            exclusions: exclusions.paths(),
             candidates,
             dirs_visited: scanner.progress.dirs_visited,
             errors: scanner.progress.errors,
             total_bytes,
             cancelled,
+            incomplete,
             elapsed_ms: started.elapsed().as_millis() as u64,
         },
         records: scanner.records,
@@ -393,12 +432,23 @@ mod tests {
         fs::write(p, vec![b'a'; bytes]).unwrap();
     }
 
+    fn req(roots: &[&Path]) -> ScanRequest {
+        ScanRequest {
+            roots: roots.iter().map(|r| r.to_string_lossy().into_owned()).collect(),
+        }
+    }
+
     fn run(root: &Path, exclusions: Vec<String>) -> ScanOutput {
-        let req = ScanRequest {
-            roots: vec![root.to_string_lossy().into_owned()],
-            exclusions,
-        };
-        scan(&req, &ProtectedPaths::empty(), &AtomicBool::new(false), |_| {}).unwrap()
+        let policy = ExclusionPolicy::from_paths(&exclusions).unwrap();
+        scan(
+            "s1",
+            &req(&[root]),
+            &policy,
+            &ProtectedPaths::empty(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap()
     }
 
     fn fixture() -> tempfile::TempDir {
@@ -438,6 +488,41 @@ mod tests {
         assert_eq!(out.summary.total_bytes, 155 + 20 + 30);
         assert_eq!(out.records.len(), 3);
         assert!(!out.summary.cancelled);
+        assert!(!out.summary.incomplete);
+        assert!(out.summary.candidates.iter().all(|c| c.id.starts_with("s1:c")));
+    }
+
+    #[test]
+    fn candidate_containing_exclusion_is_blocked() {
+        let t = tempdir().unwrap();
+        let app = t.path().join("app");
+        write(&app.join("package.json"), 1);
+        write(&app.join("vite.config.ts"), 1);
+        write(&app.join("dist/index.js"), 10);
+        write(&app.join("dist/keep/important.txt"), 10);
+        let keep = app.join("dist/keep").to_string_lossy().into_owned();
+        let out = run(t.path(), vec![keep]);
+        let dist = out
+            .summary
+            .candidates
+            .iter()
+            .find(|c| c.rule_id == "js.build-output")
+            .expect("dist is still reported");
+        assert!(dist.blocked_reason.as_deref().unwrap().contains("contains excluded"));
+        assert!(!dist.bulk_selectable);
+        assert!(out.records.is_empty(), "blocked items must not get a cleanup record");
+        assert_eq!(out.summary.total_bytes, 0);
+    }
+
+    #[test]
+    fn caution_items_are_not_bulk_selectable() {
+        let t = tempdir().unwrap();
+        write(&t.path().join("nb/.ipynb_checkpoints/a-checkpoint.ipynb"), 5);
+        let out = run(t.path(), vec![]);
+        let c = &out.summary.candidates[0];
+        assert_eq!(c.rule_id, "jupyter.checkpoints");
+        assert!(!c.bulk_selectable);
+        assert!(c.blocked_reason.is_none());
     }
 
     #[test]
@@ -461,27 +546,34 @@ mod tests {
     #[test]
     fn cancellation_stops_scan() {
         let t = fixture();
-        let req = ScanRequest {
-            roots: vec![t.path().to_string_lossy().into_owned()],
-            exclusions: vec![],
-        };
         let cancel = AtomicBool::new(true);
-        let out = scan(&req, &ProtectedPaths::empty(), &cancel, |_| {}).unwrap();
+        let out = scan(
+            "s1",
+            &req(&[t.path()]),
+            &ExclusionPolicy::default(),
+            &ProtectedPaths::empty(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
         assert!(out.summary.cancelled);
+        assert!(out.summary.incomplete);
         assert!(out.summary.candidates.is_empty());
     }
 
     #[test]
     fn nested_roots_are_deduplicated() {
         let t = fixture();
-        let req = ScanRequest {
-            roots: vec![
-                t.path().to_string_lossy().into_owned(),
-                t.path().join("web").to_string_lossy().into_owned(),
-            ],
-            exclusions: vec![],
-        };
-        let out = scan(&req, &ProtectedPaths::empty(), &AtomicBool::new(false), |_| {}).unwrap();
+        let web = t.path().join("web");
+        let out = scan(
+            "s1",
+            &req(&[t.path(), &web]),
+            &ExclusionPolicy::default(),
+            &ProtectedPaths::empty(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(out.summary.roots.len(), 1);
         assert_eq!(out.summary.candidates.len(), 3);
     }

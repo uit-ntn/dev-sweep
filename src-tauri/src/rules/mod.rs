@@ -184,10 +184,90 @@ fn verify_turbo(c: &MatchContext) -> bool {
         && (has_file(c.parent, "turbo.json") || has_entry(c.dir, "cache"))
 }
 
+const BUNDLER_CONFIGS: &[&str] = &[
+    "vite.config.js",
+    "vite.config.ts",
+    "vite.config.mjs",
+    "vite.config.cjs",
+    "vite.config.mts",
+    "webpack.config.js",
+    "webpack.config.ts",
+    "webpack.config.cjs",
+    "webpack.config.mjs",
+    "rollup.config.js",
+    "rollup.config.ts",
+    "rollup.config.mjs",
+    "tsup.config.ts",
+    "tsup.config.js",
+    "angular.json",
+    "vue.config.js",
+    "svelte.config.js",
+    "astro.config.mjs",
+    "astro.config.ts",
+    ".parcelrc",
+];
+
+/// The parent's `.gitignore` lists `name` (as `name`, `/name`, `name/`,
+/// `/name/`, `name/*` or `name/**`). Only the first 64 KiB are read.
+fn gitignored(parent: &Path, name: &str) -> bool {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(parent.join(".gitignore")) else {
+        return false;
+    };
+    let mut buf = String::new();
+    if f.take(64 * 1024).read_to_string(&mut buf).is_err() {
+        return false;
+    }
+    buf.lines().any(|line| {
+        let l = line.trim();
+        if l.starts_with('#') || l.starts_with('!') {
+            return false;
+        }
+        let l = l.strip_prefix('/').unwrap_or(l);
+        let l = l
+            .strip_suffix("/**")
+            .or_else(|| l.strip_suffix("/*"))
+            .or_else(|| l.strip_suffix('/'))
+            .unwrap_or(l);
+        l == name
+    })
+}
+
+/// The folder's top level looks like bundler output: emitted JS/CSS, source
+/// maps, an index.html or an assets folder.
+fn looks_generated(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten().take(500) {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() && matches!(name.as_str(), "assets" | "static" | "chunks" | "js" | "css") {
+            return true;
+        }
+        if ft.is_file()
+            && [".js", ".mjs", ".cjs", ".css", ".map", ".html", ".d.ts"]
+                .iter()
+                .any(|ext| name.ends_with(ext))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn verify_js_build_output(c: &MatchContext) -> bool {
-    // `dist`/`build` are ambiguous; only consider them inside a JS project
-    // that is *not* also a Gradle project (handled by its own rule).
-    has_file(c.parent, "package.json") && !has_any_file(c.parent, GRADLE_MARKERS)
+    // `dist`/`build` are ambiguous. Require (1) a JS project that is not a
+    // Gradle project (handled by its own rule), (2) contents that look like
+    // emitted output, and (3) independent evidence that the folder is a
+    // build artefact: it is git-ignored, or a bundler config sits next to it.
+    let Some(name) = c.dir.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    has_file(c.parent, "package.json")
+        && !has_any_file(c.parent, GRADLE_MARKERS)
+        && looks_generated(c.dir)
+        && (gitignored(c.parent, name) || has_any_file(c.parent, BUNDLER_CONFIGS))
 }
 
 fn verify_cargo_target(c: &MatchContext) -> bool {
@@ -319,7 +399,7 @@ pub static RULES: &[Rule] = &[
         risk: Risk::Caution,
         default_selected: false,
         description: "Common bundler output folder. The name is ambiguous — some projects commit or hand-edit it.",
-        context_hint: "Parent has package.json (and is not a Gradle project)",
+        context_hint: "Parent has package.json; folder holds emitted JS/CSS/maps; folder is git-ignored or a bundler config is present",
         verify: verify_js_build_output,
     },
     Rule {
@@ -386,6 +466,14 @@ pub fn match_dir(dir: &Path) -> Option<&'static Rule> {
         .iter()
         .filter(|r| r.match_names.contains(&name))
         .find(|r| (r.verify)(&ctx))
+}
+
+impl Rule {
+    /// Caution items must be ticked one by one and individually acknowledged
+    /// at review time; they are never included by "select all".
+    pub fn bulk_selectable(&self) -> bool {
+        self.risk != Risk::Caution
+    }
 }
 
 pub fn find_rule(id: &str) -> Option<&'static Rule> {
@@ -484,8 +572,48 @@ mod tests {
         let b = t.path().join("build");
         fs::create_dir(&b).unwrap();
         assert!(match_dir(&b).is_none());
+        // package.json alone is not enough any more.
         touch(&t.path().join("package.json"));
-        assert_eq!(match_dir(&b).unwrap().id, "js.build-output");
+        assert!(match_dir(&b).is_none());
+        // Emitted output but no evidence it is a build artefact.
+        touch(&b.join("index.js"));
+        assert!(match_dir(&b).is_none());
+        // A bundler config next to it is evidence.
+        touch(&t.path().join("vite.config.ts"));
+        let rule = match_dir(&b).unwrap();
+        assert_eq!(rule.id, "js.build-output");
+        assert_eq!(rule.risk, Risk::Caution);
+    }
+
+    #[test]
+    fn gitignore_is_evidence_for_dist() {
+        let t = tempdir().unwrap();
+        touch(&t.path().join("package.json"));
+        let d = t.path().join("dist");
+        touch(&d.join("app.js.map"));
+        assert!(match_dir(&d).is_none());
+        fs::write(t.path().join(".gitignore"), "node_modules\n/dist/\n").unwrap();
+        assert_eq!(match_dir(&d).unwrap().id, "js.build-output");
+    }
+
+    #[test]
+    fn hand_written_dist_is_not_matched() {
+        let t = tempdir().unwrap();
+        touch(&t.path().join("package.json"));
+        touch(&t.path().join("vite.config.ts"));
+        let d = t.path().join("dist");
+        // Only documents / data — not bundler output.
+        touch(&d.join("report.pdf"));
+        touch(&d.join("data.csv"));
+        assert!(match_dir(&d).is_none());
+    }
+
+    #[test]
+    fn only_caution_rules_are_not_bulk_selectable() {
+        for r in RULES {
+            assert_eq!(r.bulk_selectable(), r.risk != Risk::Caution, "{}", r.id);
+        }
+        assert_eq!(find_rule("jupyter.checkpoints").unwrap().risk, Risk::Caution);
     }
 
     #[test]

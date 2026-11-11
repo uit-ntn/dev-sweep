@@ -1,10 +1,13 @@
 //! Cleanup coordinator.
 //!
-//! The UI can only refer to candidates by the opaque id issued during the
-//! most recent scan; it can never pass an arbitrary path to delete. Every item
-//! is revalidated immediately before it is moved to the Trash.
+//! The UI can only refer to candidates by the opaque, session-scoped id issued
+//! during the most recent scan; it can never pass an arbitrary path to delete.
+//! Every item is revalidated immediately before it is moved to the Trash,
+//! including against the *current* exclusion policy, and Caution items need
+//! an individual acknowledgement.
 
-use crate::rules;
+use crate::exclusions::ExclusionPolicy;
+use crate::rules::{self, Risk};
 use crate::safety::{self, ProtectedPaths};
 use crate::scanner::CandidateRecord;
 use serde::Serialize;
@@ -45,9 +48,27 @@ impl Remover for TrashRemover {
     }
 }
 
+/// Everything the cleaner needs besides the records themselves.
+pub struct CleanPolicy<'a> {
+    pub exclusions: &'a ExclusionPolicy,
+    pub protected: &'a ProtectedPaths,
+    /// Ids of Caution items the user acknowledged one by one at review time.
+    pub acknowledged: &'a HashSet<String>,
+}
+
 /// Re-check everything we know about a candidate. Returns a reason on failure.
-pub fn revalidate(record: &CandidateRecord, protected: &ProtectedPaths) -> Result<(), String> {
+pub fn revalidate(
+    record: &CandidateRecord,
+    exclusions: &ExclusionPolicy,
+    protected: &ProtectedPaths,
+) -> Result<(), String> {
     let path = &record.path;
+
+    // Cheap, path-only check first: never touch excluded data, and never
+    // remove a folder that contains an excluded folder.
+    if let Some(reason) = exclusions.conflict(path) {
+        return Err(reason);
+    }
 
     let meta = std::fs::symlink_metadata(path).map_err(|_| "no longer exists".to_string())?;
     if safety::is_link_like(&meta) {
@@ -72,6 +93,9 @@ pub fn revalidate(record: &CandidateRecord, protected: &ProtectedPaths) -> Resul
         return Err("path is outside the authorised scan root".into());
     }
     protected.check(&canonical)?;
+    if let Some(reason) = exclusions.conflict(&canonical) {
+        return Err(reason);
+    }
 
     if !rules::rule_still_matches(record.rule, &canonical) {
         return Err("project context no longer matches the rule".into());
@@ -85,7 +109,7 @@ pub fn clean(
     ids: &[String],
     records: &HashMap<String, CandidateRecord>,
     sizes: &HashMap<String, u64>,
-    protected: &ProtectedPaths,
+    policy: &CleanPolicy,
     remover: &dyn Remover,
 ) -> Vec<CleanItemResult> {
     let mut seen = HashSet::new();
@@ -123,7 +147,10 @@ pub fn clean(
             {
                 return skip("contained in another selected item".into());
             }
-            if let Err(reason) = revalidate(record, protected) {
+            if record.rule.risk == Risk::Caution && !policy.acknowledged.contains(id) {
+                return skip("Caution item was not individually confirmed".into());
+            }
+            if let Err(reason) = revalidate(record, policy.exclusions, policy.protected) {
                 return skip(reason);
             }
             match remover.remove(&record.path) {
@@ -150,6 +177,7 @@ pub fn clean(
 mod tests {
     use super::*;
     use crate::scanner::{scan, ScanRequest};
+    use std::sync::OnceLock;
     use std::cell::RefCell;
     use std::fs;
     use std::path::PathBuf;
@@ -171,6 +199,59 @@ mod tests {
         fs::write(p, b"data").unwrap();
     }
 
+    fn no_ack() -> &'static HashSet<String> {
+        static EMPTY: OnceLock<HashSet<String>> = OnceLock::new();
+        EMPTY.get_or_init(HashSet::new)
+    }
+
+    fn run_clean(
+        ids: &[String],
+        records: &HashMap<String, CandidateRecord>,
+        sizes: &HashMap<String, u64>,
+        exclusions: &ExclusionPolicy,
+        acknowledged: &HashSet<String>,
+        remover: &dyn Remover,
+    ) -> Vec<CleanItemResult> {
+        let protected = ProtectedPaths::empty();
+        let policy = CleanPolicy {
+            exclusions,
+            protected: &protected,
+            acknowledged,
+        };
+        clean(ids, records, sizes, &policy, remover)
+    }
+
+    fn clean_all(
+        ids: &[String],
+        records: &HashMap<String, CandidateRecord>,
+        sizes: &HashMap<String, u64>,
+        remover: &dyn Remover,
+    ) -> Vec<CleanItemResult> {
+        run_clean(ids, records, sizes, &ExclusionPolicy::default(), no_ack(), remover)
+    }
+
+    fn scan_dir(root: &Path) -> (HashMap<String, CandidateRecord>, HashMap<String, u64>) {
+        let req = ScanRequest {
+            roots: vec![root.to_string_lossy().into_owned()],
+        };
+        let out = scan(
+            "s1",
+            &req,
+            &ExclusionPolicy::default(),
+            &ProtectedPaths::empty(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let sizes = out
+            .summary
+            .candidates
+            .iter()
+            .map(|c| (c.id.clone(), c.size_bytes))
+            .collect();
+        (out.records.into_iter().collect(), sizes)
+    }
+
     fn setup() -> (tempfile::TempDir, HashMap<String, CandidateRecord>, HashMap<String, u64>) {
         let t = tempdir().unwrap();
         write(&t.path().join("app/package.json"));
@@ -178,9 +259,16 @@ mod tests {
         write(&t.path().join("app/node_modules/x/index.js"));
         let req = ScanRequest {
             roots: vec![t.path().to_string_lossy().into_owned()],
-            exclusions: vec![],
         };
-        let out = scan(&req, &ProtectedPaths::empty(), &AtomicBool::new(false), |_| {}).unwrap();
+        let out = scan(
+            "s1",
+            &req,
+            &ExclusionPolicy::default(),
+            &ProtectedPaths::empty(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
         let sizes = out
             .summary
             .candidates
@@ -195,7 +283,7 @@ mod tests {
         let (t, records, sizes) = setup();
         let ids: Vec<String> = records.keys().cloned().collect();
         let fake = FakeRemover(RefCell::new(vec![]));
-        let res = clean(&ids, &records, &sizes, &ProtectedPaths::empty(), &fake);
+        let res = clean_all(&ids, &records, &sizes, &fake);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].status, CleanStatus::Trashed);
         assert!(!t.path().join("app/node_modules").exists());
@@ -207,7 +295,7 @@ mod tests {
     fn unknown_ids_are_skipped() {
         let (_t, records, sizes) = setup();
         let fake = FakeRemover(RefCell::new(vec![]));
-        let res = clean(&["nope".into()], &records, &sizes, &ProtectedPaths::empty(), &fake);
+        let res = clean_all(&["nope".into()], &records, &sizes, &fake);
         assert_eq!(res[0].status, CleanStatus::Skipped);
         assert!(fake.0.borrow().is_empty());
     }
@@ -217,7 +305,7 @@ mod tests {
         let (_t, records, sizes) = setup();
         let id = records.keys().next().unwrap().clone();
         let fake = FakeRemover(RefCell::new(vec![]));
-        let res = clean(&[id.clone(), id], &records, &sizes, &ProtectedPaths::empty(), &fake);
+        let res = clean_all(&[id.clone(), id], &records, &sizes, &fake);
         assert_eq!(res.len(), 1);
         assert_eq!(fake.0.borrow().len(), 1);
     }
@@ -232,7 +320,7 @@ mod tests {
         write(&nm.join("other.js"));
         let ids: Vec<String> = records.keys().cloned().collect();
         let fake = FakeRemover(RefCell::new(vec![]));
-        let res = clean(&ids, &records, &sizes, &ProtectedPaths::empty(), &fake);
+        let res = clean_all(&ids, &records, &sizes, &fake);
         assert_eq!(res[0].status, CleanStatus::Skipped, "{}", res[0].message);
         assert!(nm.join("other.js").exists());
     }
@@ -243,7 +331,7 @@ mod tests {
         fs::remove_file(t.path().join("app/package.json")).unwrap();
         let ids: Vec<String> = records.keys().cloned().collect();
         let fake = FakeRemover(RefCell::new(vec![]));
-        let res = clean(&ids, &records, &sizes, &ProtectedPaths::empty(), &fake);
+        let res = clean_all(&ids, &records, &sizes, &fake);
         assert_eq!(res[0].status, CleanStatus::Skipped);
         assert!(t.path().join("app/node_modules/x/index.js").exists());
     }
@@ -254,8 +342,65 @@ mod tests {
         fs::remove_dir_all(t.path().join("app/node_modules")).unwrap();
         let ids: Vec<String> = records.keys().cloned().collect();
         let fake = FakeRemover(RefCell::new(vec![]));
-        let res = clean(&ids, &records, &sizes, &ProtectedPaths::empty(), &fake);
+        let res = clean_all(&ids, &records, &sizes, &fake);
         assert_eq!(res[0].status, CleanStatus::Skipped);
         assert!(fake.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn excluded_child_protects_parent_even_with_valid_id() {
+        // Scan happened before the exclusion existed, so `dist` has a record.
+        let t = tempdir().unwrap();
+        let app = t.path().join("app");
+        write(&app.join("package.json"));
+        write(&app.join("vite.config.ts"));
+        write(&app.join("dist/index.js"));
+        write(&app.join("dist/keep/important.txt"));
+        let (records, sizes) = scan_dir(t.path());
+        assert_eq!(records.len(), 1);
+        let ids: Vec<String> = records.keys().cloned().collect();
+
+        // Now `dist/keep` is excluded; a direct call with the old id must not
+        // move `dist` (and with it `dist/keep`) to the Trash.
+        let keep = app.join("dist/keep").to_string_lossy().into_owned();
+        let policy = ExclusionPolicy::from_paths(&[keep]).unwrap();
+        let fake = FakeRemover(RefCell::new(vec![]));
+        // Caution items need acknowledgement; acknowledge so only the
+        // exclusion check can stop it.
+        let ack: HashSet<String> = ids.iter().cloned().collect();
+        let res = run_clean(&ids, &records, &sizes, &policy, &ack, &fake);
+        assert_eq!(res[0].status, CleanStatus::Skipped);
+        assert!(res[0].message.contains("contains excluded"), "{}", res[0].message);
+        assert!(fake.0.borrow().is_empty());
+        assert!(app.join("dist/keep/important.txt").exists());
+    }
+
+    #[test]
+    fn excluded_item_itself_is_skipped() {
+        let (t, records, sizes) = setup();
+        let nm = t.path().join("app/node_modules").to_string_lossy().into_owned();
+        let policy = ExclusionPolicy::from_paths(&[nm]).unwrap();
+        let ids: Vec<String> = records.keys().cloned().collect();
+        let fake = FakeRemover(RefCell::new(vec![]));
+        let res = run_clean(&ids, &records, &sizes, &policy, no_ack(), &fake);
+        assert_eq!(res[0].status, CleanStatus::Skipped);
+        assert!(fake.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn caution_item_requires_individual_acknowledgement() {
+        let t = tempdir().unwrap();
+        write(&t.path().join("nb/.ipynb_checkpoints/a-checkpoint.ipynb"));
+        let (records, sizes) = scan_dir(t.path());
+        let ids: Vec<String> = records.keys().cloned().collect();
+        let fake = FakeRemover(RefCell::new(vec![]));
+
+        let res = clean_all(&ids, &records, &sizes, &fake);
+        assert_eq!(res[0].status, CleanStatus::Skipped);
+        assert!(fake.0.borrow().is_empty());
+
+        let ack: HashSet<String> = ids.iter().cloned().collect();
+        let res = run_clean(&ids, &records, &sizes, &ExclusionPolicy::default(), &ack, &fake);
+        assert_eq!(res[0].status, CleanStatus::Trashed);
     }
 }

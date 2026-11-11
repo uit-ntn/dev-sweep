@@ -12,6 +12,23 @@ export function formatBytes(bytes: number): string {
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${UNITS[i]}`;
 }
 
+/** "+1.2 GiB" / "−300 MiB" for deltas. */
+export function formatSignedBytes(delta: number): string {
+  if (delta === 0) return "±0 B";
+  return `${delta > 0 ? "+" : "−"}${formatBytes(Math.abs(delta))}`;
+}
+
+/** "2 days", "5 hours", "12 minutes". */
+export function formatInterval(ms: number): string {
+  const min = ms / 60000;
+  if (min < 1) return "under a minute";
+  if (min < 60) return `${Math.round(min)} minute${Math.round(min) === 1 ? "" : "s"}`;
+  const h = min / 60;
+  if (h < 48) return `${Math.round(h)} hour${Math.round(h) === 1 ? "" : "s"}`;
+  const d = h / 24;
+  return `${d < 10 ? d.toFixed(1).replace(/\.0$/, "") : Math.round(d)} days`;
+}
+
 export function formatCount(n: number): string {
   return n.toLocaleString();
 }

@@ -3,7 +3,7 @@ import * as api from "../lib/api";
 import { load, save } from "../lib/storage";
 import type {
   Candidate,
-  CleanItemResult,
+  CleanReport,
   HistoryEntry,
   Page,
   Risk,
@@ -24,43 +24,58 @@ export interface Filters {
 
 interface Prefs {
   roots: string[];
-  exclusions: string[];
   theme: Theme;
+}
+
+/** v1 prefs also held exclusions; they are migrated to the backend once. */
+interface LegacyPrefs extends Prefs {
+  exclusions?: string[];
 }
 
 const PREFS_KEY = "devsweep.prefs.v1";
 const HISTORY_KEY = "devsweep.history.v1";
 const HISTORY_LIMIT = 50;
 
-const initialPrefs = load<Prefs>(PREFS_KEY, { roots: [], exclusions: [], theme: "system" });
+const initialPrefs = load<LegacyPrefs>(PREFS_KEY, { roots: [], theme: "system" });
+
+/** Only items that are cleanable at all can be selected. */
+export const isSelectable = (c: Candidate) => c.blockedReason == null;
 
 interface SweepState extends Prefs {
   page: Page;
   rules: RuleInfo[];
 
+  /** Backend-owned exclusion list (source of truth lives in Rust). */
+  exclusions: string[];
+  exclusionError: string | null;
+
   scanning: boolean;
   progress: ScanProgress | null;
   liveCandidates: Candidate[];
   summary: ScanSummary | null;
+  /** Set when exclusions changed after `summary` was produced. */
+  summaryStale: boolean;
   scanError: string | null;
 
   filters: Filters;
   sort: SortKey;
   selected: Set<string>;
+  /** Caution items the user individually confirmed on the review screen. */
+  acknowledged: Set<string>;
   inspectedId: string | null;
 
   cleaning: boolean;
-  cleanResults: CleanItemResult[] | null;
+  cleanReport: CleanReport | null;
   cleanError: string | null;
 
   history: HistoryEntry[];
 
   setPage(p: Page): void;
-  loadRules(): Promise<void>;
+  init(): Promise<void>;
   addRoots(paths: string[]): Promise<string[]>;
   removeRoot(path: string): void;
-  addExclusions(paths: string[]): void;
-  removeExclusion(path: string): void;
+  addExclusions(paths: string[]): Promise<void>;
+  removeExclusion(path: string): Promise<void>;
   setTheme(t: Theme): void;
 
   startScan(): Promise<void>;
@@ -70,8 +85,10 @@ interface SweepState extends Prefs {
   setFilters(f: Partial<Filters>): void;
   setSort(s: SortKey): void;
   toggleSelected(id: string): void;
-  setSelected(ids: string[], on: boolean): void;
+  /** Bulk selection: only adds bulk-selectable items (never Caution). */
+  selectBulk(candidates: Candidate[], on: boolean): void;
   clearSelection(): void;
+  toggleAcknowledged(id: string): void;
   inspect(id: string | null): void;
 
   runCleanup(): Promise<void>;
@@ -80,7 +97,7 @@ interface SweepState extends Prefs {
 }
 
 function persistPrefs(s: Prefs) {
-  save(PREFS_KEY, { roots: s.roots, exclusions: s.exclusions, theme: s.theme });
+  save(PREFS_KEY, { roots: s.roots, theme: s.theme });
 }
 
 function pushHistory(history: HistoryEntry[], entry: HistoryEntry): HistoryEntry[] {
@@ -90,34 +107,51 @@ function pushHistory(history: HistoryEntry[], entry: HistoryEntry): HistoryEntry
 }
 
 export const useSweepStore = create<SweepState>((set, get) => ({
-  ...initialPrefs,
+  roots: initialPrefs.roots,
+  theme: initialPrefs.theme,
   page: "dashboard",
   rules: [],
+
+  exclusions: [],
+  exclusionError: null,
 
   scanning: false,
   progress: null,
   liveCandidates: [],
   summary: null,
+  summaryStale: false,
   scanError: null,
 
   filters: { text: "", ecosystems: [], risks: [], minBytes: 0 },
   sort: "size",
   selected: new Set(),
+  acknowledged: new Set(),
   inspectedId: null,
 
   cleaning: false,
-  cleanResults: null,
+  cleanReport: null,
   cleanError: null,
 
   history: load<HistoryEntry[]>(HISTORY_KEY, []),
 
   setPage: (page) => set({ page }),
 
-  loadRules: async () => {
+  init: async () => {
     try {
       set({ rules: await api.listRules() });
     } catch {
       /* rules are informational only */
+    }
+    try {
+      let exclusions = await api.getExclusions();
+      const legacy = initialPrefs.exclusions ?? [];
+      if (exclusions.length === 0 && legacy.length > 0 && api.inTauri()) {
+        exclusions = await api.setExclusions(legacy);
+      }
+      persistPrefs(get()); // drops the legacy field
+      set({ exclusions });
+    } catch (e) {
+      set({ exclusionError: String(e) });
     }
   },
 
@@ -142,15 +176,12 @@ export const useSweepStore = create<SweepState>((set, get) => ({
     persistPrefs(get());
   },
 
-  addExclusions: (paths) => {
-    const exclusions = Array.from(new Set([...get().exclusions, ...paths]));
-    set({ exclusions });
-    persistPrefs(get());
+  addExclusions: async (paths) => {
+    await applyExclusions(Array.from(new Set([...get().exclusions, ...paths])));
   },
 
-  removeExclusion: (path) => {
-    set({ exclusions: get().exclusions.filter((e) => e !== path) });
-    persistPrefs(get());
+  removeExclusion: async (path) => {
+    await applyExclusions(get().exclusions.filter((e) => e !== path));
   },
 
   setTheme: (theme) => {
@@ -159,28 +190,30 @@ export const useSweepStore = create<SweepState>((set, get) => ({
   },
 
   startScan: async () => {
-    const { roots, exclusions, scanning } = get();
-    if (scanning || roots.length === 0) return;
+    const { roots, scanning, cleaning } = get();
+    if (scanning || cleaning || roots.length === 0) return;
     set({
       scanning: true,
       progress: null,
       liveCandidates: [],
       summary: null,
+      summaryStale: false,
       scanError: null,
       selected: new Set(),
+      acknowledged: new Set(),
       inspectedId: null,
-      cleanResults: null,
+      cleanReport: null,
       cleanError: null,
     });
     try {
-      const summary = await api.startScan({ roots, exclusions });
+      const summary = await api.startScan({ roots });
       set({
         summary,
         liveCandidates: summary.candidates,
         history: pushHistory(get().history, {
           at: Date.now(),
           kind: "scan",
-          items: summary.candidates.length,
+          items: summary.candidates.filter(isSelectable).length,
           bytes: summary.totalBytes,
         }),
       });
@@ -196,63 +229,93 @@ export const useSweepStore = create<SweepState>((set, get) => ({
   },
 
   handleProgress: (p) => {
-    if (!get().scanning) return;
-    set((s) => ({
+    const s = get();
+    if (!s.scanning) return;
+    // Ignore late events from an earlier scan session.
+    if (s.progress && s.progress.sessionId !== p.sessionId) return;
+    set({
       progress: p,
-      liveCandidates: p.newCandidates.length
-        ? [...s.liveCandidates, ...p.newCandidates]
-        : s.liveCandidates,
-    }));
+      liveCandidates: p.newCandidates.length ? [...s.liveCandidates, ...p.newCandidates] : s.liveCandidates,
+    });
   },
 
   setFilters: (f) => set({ filters: { ...get().filters, ...f } }),
   setSort: (sort) => set({ sort }),
 
   toggleSelected: (id) => {
+    const c = get().liveCandidates.find((x) => x.id === id);
+    if (!c || !isSelectable(c)) return;
     const selected = new Set(get().selected);
-    if (selected.has(id)) selected.delete(id);
-    else selected.add(id);
-    set({ selected });
+    const acknowledged = new Set(get().acknowledged);
+    if (selected.has(id)) {
+      selected.delete(id);
+      acknowledged.delete(id);
+    } else selected.add(id);
+    set({ selected, acknowledged });
   },
 
-  setSelected: (ids, on) => {
+  selectBulk: (candidates, on) => {
     const selected = new Set(get().selected);
-    for (const id of ids) {
-      if (on) selected.add(id);
-      else selected.delete(id);
+    const acknowledged = new Set(get().acknowledged);
+    for (const c of candidates) {
+      if (on) {
+        if (c.bulkSelectable && isSelectable(c)) selected.add(c.id);
+      } else {
+        selected.delete(c.id);
+        acknowledged.delete(c.id);
+      }
     }
-    set({ selected });
+    set({ selected, acknowledged });
   },
 
-  clearSelection: () => set({ selected: new Set() }),
+  clearSelection: () => set({ selected: new Set(), acknowledged: new Set() }),
+
+  toggleAcknowledged: (id) => {
+    const acknowledged = new Set(get().acknowledged);
+    if (acknowledged.has(id)) acknowledged.delete(id);
+    else acknowledged.add(id);
+    set({ acknowledged });
+  },
+
   inspect: (inspectedId) => set({ inspectedId }),
 
   runCleanup: async () => {
-    const ids = Array.from(get().selected);
-    if (ids.length === 0 || get().cleaning) return;
-    set({ cleaning: true, cleanError: null, cleanResults: null });
+    const { summary, selected, acknowledged, cleaning, scanning, summaryStale } = get();
+    const ids = Array.from(selected);
+    if (!summary || ids.length === 0 || cleaning || scanning || summaryStale) return;
+    set({ cleaning: true, cleanError: null, cleanReport: null });
     try {
-      const results = await api.cleanItems(ids);
-      const trashed = new Set(results.filter((r) => r.status === "trashed").map((r) => r.id));
-      const bytes = results
+      const report = await api.cleanItems(
+        summary.sessionId,
+        ids,
+        ids.filter((id) => acknowledged.has(id)),
+      );
+      // Only apply results to the session that owns them.
+      if (get().summary?.sessionId !== report.sessionId) {
+        set({ cleanReport: report });
+        return;
+      }
+      const trashed = new Set(report.results.filter((r) => r.status === "trashed").map((r) => r.id));
+      const bytes = report.results
         .filter((r) => r.status === "trashed")
         .reduce((sum, r) => sum + r.sizeBytes, 0);
-      const summary = get().summary;
+      const cur = get().summary!;
       set({
-        cleanResults: results,
+        cleanReport: report,
         selected: new Set(ids.filter((id) => !trashed.has(id))),
+        acknowledged: new Set([...get().acknowledged].filter((id) => !trashed.has(id))),
         liveCandidates: get().liveCandidates.filter((c) => !trashed.has(c.id)),
-        summary: summary && {
-          ...summary,
-          candidates: summary.candidates.filter((c) => !trashed.has(c.id)),
-          totalBytes: summary.totalBytes - bytes,
+        summary: {
+          ...cur,
+          candidates: cur.candidates.filter((c) => !trashed.has(c.id)),
+          totalBytes: cur.totalBytes - bytes,
         },
         history: pushHistory(get().history, {
           at: Date.now(),
           kind: "cleanup",
           items: trashed.size,
           bytes,
-          failed: results.length - trashed.size,
+          failed: report.results.length - trashed.size,
         }),
       });
     } catch (e) {
@@ -262,13 +325,29 @@ export const useSweepStore = create<SweepState>((set, get) => ({
     }
   },
 
-  resetCleanup: () => set({ cleanResults: null, cleanError: null }),
+  resetCleanup: () => set({ cleanReport: null, cleanError: null }),
 
   clearHistory: () => {
     save(HISTORY_KEY, []);
     set({ history: [] });
   },
 }));
+
+async function applyExclusions(next: string[]) {
+  const { summary, exclusions: before } = useSweepStore.getState();
+  try {
+    const exclusions = await api.setExclusions(next);
+    const changed = JSON.stringify([...before].sort()) !== JSON.stringify([...exclusions].sort());
+    useSweepStore.setState({
+      exclusions,
+      exclusionError: null,
+      // The backend invalidated the previous scan; mirror that in the UI.
+      summaryStale: useSweepStore.getState().summaryStale || (changed && summary != null),
+    });
+  } catch (e) {
+    useSweepStore.setState({ exclusionError: String(e) });
+  }
+}
 
 /** Candidates after filters and sorting are applied (pure; memoize at call site). */
 export function filterAndSort(candidates: Candidate[], filters: Filters, sort: SortKey): Candidate[] {
