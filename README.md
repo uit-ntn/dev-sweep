@@ -13,7 +13,7 @@ Built with **Tauri 2 · Rust · React · TypeScript**
 </div>
 
 > [!IMPORTANT]
-> **Project status: Planning / early development.** This README describes the intended product and proposed architecture. Features listed below are **not yet guaranteed to be implemented**, and there may not be a downloadable release or runnable application yet. Check the repository's commits and [Releases](../../releases) for the actual implementation status.
+> **Project status: early development (Phase 1 MVP in progress).** The Tauri + React scaffold, the Rust scanner / rule engine / Trash-first cleaner and the four main views are committed, but the app has **not yet been tested end-to-end on Windows** and there is no release. Checked boxes below reflect code that exists in the repository, not a tested release. Keep backups and use on non-critical folders first.
 
 ## Overview
 
@@ -48,32 +48,32 @@ The following items are **planned**, not a statement of currently shipped functi
 
 ### Core scanning
 
-- [ ] Select one or more folders or drives to scan.
-- [ ] Detect common developer-generated directories using built-in rules.
-- [ ] Show total estimated reclaimable bytes and per-item sizes.
-- [ ] Filter by ecosystem, path, file type, size, and risk level.
-- [ ] Sort results by size and inspect a directory before cleanup.
-- [ ] Stream progress to the interface without blocking the UI.
-- [ ] Cancel an in-progress scan.
-- [ ] Exclude chosen directories and protected filesystem locations.
-- [ ] Avoid unexpectedly following symbolic links, junctions, or mount points.
+- [x] Select one or more folders or drives to scan.
+- [x] Detect common developer-generated directories using built-in rules.
+- [x] Show total estimated reclaimable bytes and per-item sizes.
+- [x] Filter by ecosystem, path, file type, size, and risk level.
+- [x] Sort results by size and inspect a directory before cleanup.
+- [x] Stream progress to the interface without blocking the UI.
+- [x] Cancel an in-progress scan.
+- [x] Exclude chosen directories and protected filesystem locations.
+- [x] Avoid unexpectedly following symbolic links, junctions, or mount points.
 
 ### Cleanup
 
-- [ ] Preview every selected target before any modification.
-- [ ] Default to **no automatic deletion**.
-- [ ] Offer OS Trash / Recycle Bin as the preferred cleanup action where supported.
+- [x] Preview every selected target before any modification.
+- [x] Default to **no automatic deletion**.
+- [x] Offer OS Trash / Recycle Bin as the preferred cleanup action where supported.
 - [ ] Treat permanent deletion as a distinct, clearly warned action, if added.
-- [ ] Revalidate path, identity, type, and permitted scope immediately before deletion.
-- [ ] Report successful, skipped, and failed items individually.
-- [ ] Keep a privacy-conscious local history without storing unnecessary filenames.
+- [x] Revalidate path, identity, type, and permitted scope immediately before deletion.
+- [x] Report successful, skipped, and failed items individually.
+- [x] Keep a privacy-conscious local history without storing unnecessary filenames.
 
 ### Developer experience
 
 - [ ] Detection rules for JavaScript/TypeScript, Python, Rust, Java, and common web frameworks.
 - [ ] Conservative IDE cache inspection for VS Code and Cursor.
 - [ ] Custom rules, with safeguards against unsafe broad matches.
-- [ ] User-maintained allowlist / exclusion list.
+- [x] User-maintained allowlist / exclusion list.
 - [ ] Windows-first releases, with macOS and Linux under consideration.
 
 ## Supported cleanup targets
@@ -224,7 +224,7 @@ dev-sweep/
 ## Getting started
 
 > [!NOTE]
-> The instructions below assume the project has been scaffolded using **Tauri 2 + React + TypeScript + npm**. At the planning stage, cloning this repository alone may **not** provide a runnable app. Create the scaffold first, or follow the setup instructions committed with the first implementation.
+> The repository is already scaffolded with **Tauri 2 + React + TypeScript + npm**; you do not need to run `create-tauri-app`.
 
 ### Prerequisites (Windows development)
 
@@ -257,7 +257,30 @@ npm install
 npm run tauri dev
 ```
 
-The last two commands work **only after** `package.json`, Tauri configuration, and the application sources have been committed. If the repository is still documentation-only, follow the scaffold step above first.
+Run the Rust test suite (uses temporary-directory fixtures only, and a fake remover — it never touches the real Trash):
+
+```bash
+cd src-tauri
+cargo test
+```
+
+### Project layout
+
+```text
+src/                     React UI
+  pages/                 Dashboard, Scanner, CleanupReview, Settings
+  stores/useSweepStore   Zustand store (roots, scan, filters, selection, history)
+  lib/api.ts             Typed wrappers around Tauri commands
+src-tauri/src/
+  rules/                 Built-in detection rules + project-context checks
+  scanner/               Cancellable traversal, sizing, progress events
+  cleaner/               Revalidation + Trash-first cleanup
+  safety.rs              Protected paths, link/junction detection, dir identity
+  commands.rs            Tauri commands: list_rules, validate_root,
+                         start_scan, cancel_scan, clean_items
+```
+
+**Safety design in the code:** the UI never sends a path to delete — only opaque ids issued by the most recent scan. Before each item is moved to the Trash the backend re-checks that it still exists, is not a link/junction, has the same identity (NTFS file index / inode + birth time), resolves to the same canonical path, sits strictly inside its scan root, is not protected, and still matches its rule. Anything that fails is reported as *Skipped*.
 
 ### Frontend-only development (when applicable)
 
@@ -346,21 +369,23 @@ Any future update checks, telemetry, or crash reporting should be **documented s
 
 ### Phase 1 — Minimum viable product
 
-- [ ] Initialize Tauri 2 + React + TypeScript project.
-- [ ] Create the main desktop window and navigation.
-- [ ] Implement user-selected scan roots.
-- [ ] Detect `node_modules`, `.venv`, `__pycache__`, `.next`, and Rust `target` with context checks.
-- [ ] Calculate directory sizes and display results.
-- [ ] Implement safe preview, explicit selection, and Trash-first cleanup.
-- [ ] Add cancellation, error handling, and Windows testing.
+- [x] Initialize Tauri 2 + React + TypeScript project.
+- [x] Create the main desktop window and navigation.
+- [x] Implement user-selected scan roots.
+- [x] Detect `node_modules`, `.venv`, `__pycache__`, `.next`, and Rust `target` with context checks.
+- [x] Calculate directory sizes and display results.
+- [x] Implement safe preview, explicit selection, and Trash-first cleanup.
+- [x] Add cancellation and error handling.
+- [ ] End-to-end testing on Windows.
 
 ### Phase 2 — Better developer coverage
 
-- [ ] Add framework/test/build cache rules.
+- [x] Add framework/test/build cache rules (Nuxt, Turborepo, pytest/mypy/ruff, Maven, Gradle, `dist`/`build`).
+- [ ] Vite cache (`node_modules/.vite`) as a separate item — currently counted as part of `node_modules`.
 - [ ] Add conservative VS Code and Cursor cache inspection.
 - [ ] Add exclusions and custom scan profiles.
 - [ ] Improve progress, sorting, and storage visualization.
-- [ ] Add automated tests for safety invariants and edge cases.
+- [ ] Add automated tests for safety invariants and edge cases (initial Rust unit tests exist; more needed).
 
 ### Phase 3 — Distribution and polish
 
