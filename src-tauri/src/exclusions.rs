@@ -24,10 +24,28 @@ pub struct ExclusionPolicy {
     entries: Vec<Exclusion>,
 }
 
+fn resolve_exclusion(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(resolved) = ancestor.canonicalize() {
+            // The unresolved suffix can name folders that do not exist yet.
+            // Resolve the existing prefix so aliases such as Windows 8.3
+            // paths still match the canonical paths used by the scanner.
+            let suffix = path
+                .strip_prefix(ancestor)
+                .expect("ancestor is a path prefix");
+            return if suffix.as_os_str().is_empty() {
+                resolved
+            } else {
+                resolved.join(suffix)
+            };
+        }
+    }
+    path.to_path_buf()
+}
+
 impl ExclusionPolicy {
-    /// Build a policy from user input. Paths must be absolute. Existing
-    /// folders are canonicalized; folders that do not exist (yet) are kept
-    /// as typed and compared lexically.
+    /// Build a policy from absolute paths. Resolve their existing prefixes
+    /// and compare any remaining components lexically.
     pub fn from_paths(paths: &[String]) -> Result<Self, String> {
         let mut entries: Vec<Exclusion> = Vec::new();
         for raw in paths {
@@ -39,7 +57,7 @@ impl ExclusionPolicy {
             if !p.is_absolute() {
                 return Err(format!("{raw}: exclusions must be absolute paths"));
             }
-            let resolved: PathBuf = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            let resolved = resolve_exclusion(p);
             let key = safety::path_key(&resolved);
             if entries.iter().any(|e| e.key == key) {
                 continue;
@@ -125,7 +143,7 @@ mod tests {
         let dist = t.path().join("app/dist").canonicalize().unwrap();
         assert!(policy.conflict(&dist).unwrap().starts_with("contains"));
         assert!(!policy.excludes(&dist));
-        let inner = keep.join("x");
+        let inner = keep.canonicalize().unwrap().join("x");
         assert!(policy.conflict(&inner).unwrap().starts_with("inside"));
         assert!(policy.excludes(&inner));
         let sibling = t.path().join("app/src");
@@ -133,11 +151,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_folders_are_compared_lexically() {
+    fn missing_folders_use_the_canonical_existing_prefix() {
         let t = tempdir().unwrap();
         let ghost = t.path().join("later/dist");
         let policy = ExclusionPolicy::from_paths(&[ghost.to_string_lossy().into_owned()]).unwrap();
-        assert!(policy.excludes(&ghost.join("a")));
+        let canonical_root = t.path().canonicalize().unwrap();
+        assert!(policy.excludes(&canonical_root.join("later").join("dist").join("a")));
+        assert!(policy
+            .conflict(&canonical_root)
+            .unwrap()
+            .starts_with("contains"));
     }
 
     #[test]
