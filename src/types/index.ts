@@ -207,4 +207,34 @@ export interface Comparison {
   unreadableSkipped: number;
 }
 
-export type Page = "dashboard" | "scanner" | "review" | "disk" | "settings";
+export type Page = "dashboard" | "scanner" | "review" | "disk" | "apps" | "settings";
+
+export interface InstalledApp {
+  name: string;
+  version: string;
+  publisher: string;
+  location: string;
+  source: "storeSigned" | "unknown";
+  registration: "desktop" | "msix";
+}
+
+export interface AppInventory {
+  apps: InstalledApp[];
+  warnings: string[];
+}
+
+export type SupportedBrowser = "chrome" | "edge";
+
+export interface AppCacheSize {
+  path: string;
+  bytes: number;
+  unreadable: number;
+}
+
+export interface AiDataItem {
+  tool: string;
+  kind: string;
+  path: string;
+  bytes: number;
+  incomplete: boolean;
+}

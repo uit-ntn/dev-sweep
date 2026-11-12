@@ -1,10 +1,12 @@
 //! DevSweep core: rule matching, scanning, Trash-first cleanup, and a
 //! read-only disk analyzer with local snapshots.
 
+pub mod ai_data;
 pub mod cleaner;
 pub mod commands;
 pub mod disk_usage;
 pub mod exclusions;
+pub mod installed_apps;
 pub mod rules;
 pub mod safety;
 pub mod scanner;
@@ -40,6 +42,10 @@ pub fn run() {
             commands::delete_snapshot,
             commands::clear_snapshots,
             commands::compare_snapshots,
+            commands::list_installed_apps,
+            commands::measure_app_cache,
+            commands::inspect_ai_data,
+            commands::inspect_ai_project,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DevSweep");

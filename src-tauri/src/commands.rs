@@ -10,9 +10,11 @@
 //!   only one returned by `list_volumes`. It is read-only and its results use
 //!   numeric node/file indices that the cleanup commands never accept.
 
+use crate::ai_data::{self, DataItem};
 use crate::cleaner::{self, CleanItemResult, CleanPolicy, TrashRemover};
 use crate::disk_usage::{self, AnalysisProgress, AnalysisSummary, DirView, FileInfo, RevealTarget, VolumeInfo};
 use crate::exclusions::{self, ExclusionPolicy, StoredSettings};
+use crate::installed_apps::{self, Browser, CacheSize, Inventory};
 use crate::rules::{self, RuleInfo};
 use crate::safety::{self, ProtectedPaths};
 use crate::scanner::{self, ScanRequest, ScanSummary};
@@ -27,6 +29,34 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 pub const SCAN_PROGRESS_EVENT: &str = "scan://progress";
 pub const DISK_PROGRESS_EVENT: &str = "disk://progress";
+
+#[tauri::command]
+pub async fn inspect_ai_data() -> Result<Vec<DataItem>, String> {
+    tauri::async_runtime::spawn_blocking(ai_data::local_data)
+        .await
+        .map_err(|e| format!("AI data inspection failed: {e}"))
+}
+
+#[tauri::command]
+pub async fn inspect_ai_project(path: String) -> Result<Vec<DataItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || ai_data::project_data(&path))
+        .await
+        .map_err(|e| format!("Project inspection failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn list_installed_apps() -> Result<Inventory, String> {
+    tauri::async_runtime::spawn_blocking(installed_apps::list)
+        .await
+        .map_err(|e| format!("Application inventory task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn measure_app_cache(browser: Browser) -> Result<Vec<CacheSize>, String> {
+    tauri::async_runtime::spawn_blocking(move || installed_apps::measure_cache(browser))
+        .await
+        .map_err(|e| format!("Cache measurement task failed: {e}"))?
+}
 
 pub struct AppState {
     workspace: Mutex<Workspace>,

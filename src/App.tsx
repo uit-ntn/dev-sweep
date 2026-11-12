@@ -4,6 +4,7 @@ import { useScanProgress } from "./hooks/useScanProgress";
 import { CleanupReview } from "./pages/CleanupReview";
 import { Dashboard } from "./pages/Dashboard";
 import { DiskAnalyzer } from "./pages/DiskAnalyzer";
+import { InstalledApps } from "./pages/InstalledApps";
 import { Scanner } from "./pages/Scanner";
 import { Settings } from "./pages/Settings";
 import { useSweepStore } from "./stores/useSweepStore";
@@ -33,6 +34,7 @@ export default function App() {
         {page === "scanner" && <Scanner />}
         {page === "review" && <CleanupReview />}
         {page === "disk" && <DiskAnalyzer />}
+        {page === "apps" && <InstalledApps />}
         {page === "settings" && <Settings />}
       </main>
     </div>

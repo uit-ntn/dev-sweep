@@ -17,6 +17,11 @@ const items: { page: Page; label: string; icon: string }[] = [
     icon: "M12 2a10 10 0 1 0 10 10h-10zm2-0v8h8A10 10 0 0 0 14 2",
   },
   {
+    page: "apps",
+    label: "Installed apps",
+    icon: "M3 4h18v16H3zm2 2v3h14V6zm0 5v7h14v-7z",
+  },
+  {
     page: "settings",
     label: "Settings",
     icon: "M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8m8.5 4-.1-1.3 2-1.6-2-3.4-2.4 1-2.2-1.3L15.5 3h-4l-.4 2.4L9 6.7l-2.4-1-2 3.4 2 1.6L6.5 12l.1 1.3-2 1.6 2 3.4 2.4-1 2.2 1.3.4 2.4h4l.4-2.4 2.2-1.3 2.4 1 2-3.4-2-1.6z",

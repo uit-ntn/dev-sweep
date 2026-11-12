@@ -2,8 +2,11 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
+  AiDataItem,
   AnalysisProgress,
   AnalyzeResult,
+  AppCacheSize,
+  AppInventory,
   CleanReport,
   Comparison,
   DirView,
@@ -14,6 +17,7 @@ import type {
   ScanRequest,
   ScanSummary,
   SnapshotMeta,
+  SupportedBrowser,
   VolumeInfo,
 } from "../types";
 
@@ -23,6 +27,28 @@ function requireTauri() {
   if (!inTauri()) {
     throw new Error("Filesystem access requires the DevSweep desktop app (run `npm run tauri dev`).");
   }
+}
+
+export async function listInstalledApps(): Promise<AppInventory> {
+  requireTauri();
+  return invoke<AppInventory>("list_installed_apps");
+}
+
+export async function measureAppCache(browser: SupportedBrowser): Promise<AppCacheSize[]> {
+  requireTauri();
+  return invoke<AppCacheSize[]>("measure_app_cache", { browser });
+}
+
+export async function inspectAiData(): Promise<AiDataItem[]> {
+  requireTauri();
+  return invoke<AiDataItem[]>("inspect_ai_data");
+}
+
+export async function inspectAiProject(): Promise<{ path: string; items: AiDataItem[] } | null> {
+  requireTauri();
+  const path = await open({ directory: true, multiple: false, title: "Choose a project folder" });
+  if (typeof path !== "string") return null;
+  return { path, items: await invoke<AiDataItem[]>("inspect_ai_project", { path }) };
 }
 
 // ----- Workspace -----------------------------------------------------------
