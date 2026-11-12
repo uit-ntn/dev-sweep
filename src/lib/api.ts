@@ -44,6 +44,11 @@ export async function inspectAiData(): Promise<AiDataItem[]> {
   return invoke<AiDataItem[]>("inspect_ai_data");
 }
 
+export async function inspectAppStorage(app: "postman" | "capcut"): Promise<AiDataItem[]> {
+  requireTauri();
+  return invoke<AiDataItem[]>("inspect_app_storage", { app });
+}
+
 export async function inspectAiProject(): Promise<{ path: string; items: AiDataItem[] } | null> {
   requireTauri();
   const path = await open({ directory: true, multiple: false, title: "Choose a project folder" });

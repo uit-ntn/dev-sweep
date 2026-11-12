@@ -18,7 +18,7 @@ pub struct DataItem {
 
 type Target = (&'static str, &'static str, &'static str);
 
-fn measure(root: &Path, targets: &[Target]) -> Vec<DataItem> {
+pub(crate) fn measure(root: &Path, targets: &[Target]) -> Vec<DataItem> {
     let cancel = AtomicBool::new(false);
     let mut items = Vec::new();
     'target: for &(tool, kind, relative) in targets {

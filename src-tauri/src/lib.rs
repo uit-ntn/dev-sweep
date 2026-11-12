@@ -44,6 +44,7 @@ pub fn run() {
             commands::compare_snapshots,
             commands::list_installed_apps,
             commands::measure_app_cache,
+            commands::inspect_app_storage,
             commands::inspect_ai_data,
             commands::inspect_ai_project,
         ])

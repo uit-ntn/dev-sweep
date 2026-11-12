@@ -22,6 +22,33 @@ pub struct Inventory {
 pub enum Browser {
     Chrome,
     Edge,
+    Postman,
+    Capcut,
+}
+
+pub fn inspect_storage(app: Browser) -> Result<Vec<crate::ai_data::DataItem>, String> {
+    let (variable, targets): (&str, &[(&str, &str, &str)]) = match app {
+        Browser::Postman => ("APPDATA", &[
+            ("Postman", "Cache candidate — close Postman before clearing", "Postman/Cache"),
+            ("Postman", "Cache candidate — close Postman before clearing", "Postman/Code Cache"),
+            ("Postman", "Cache candidate — close Postman before clearing", "Postman/GPUCache"),
+            ("Postman", "Diagnostic logs — inspect before clearing", "Postman/logs"),
+        ]),
+        Browser::Capcut => ("LOCALAPPDATA", &[
+            ("CapCut", "Cache candidate — review in CapCut settings", "CapCut/User Data/Cache"),
+            ("CapCut", "Cache candidate — review in CapCut settings", "CapCut/User Data/Code Cache"),
+            ("CapCut", "Diagnostic logs — inspect before clearing", "CapCut/User Data/log"),
+            ("CapCut", "Drafts and projects — keep", "CapCut/User Data/Projects"),
+        ]),
+        _ => return Err("Storage inspection is unavailable for this application".into()),
+    };
+    let root = std::env::var_os(variable)
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .ok_or("Application data directory is unavailable")?
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve application data: {e}"))?;
+    Ok(crate::ai_data::measure(&root, targets))
 }
 
 #[derive(Serialize)]
@@ -93,6 +120,7 @@ pub fn measure_cache(browser: Browser) -> Result<Vec<CacheSize>, String> {
     let components = match browser {
         Browser::Chrome => ["Google", "Chrome", "User Data"],
         Browser::Edge => ["Microsoft", "Edge", "User Data"],
+        _ => return Err("Use application storage inspection for this application".into()),
     };
     for part in components {
         root.push(part);

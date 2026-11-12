@@ -31,6 +31,13 @@ pub const SCAN_PROGRESS_EVENT: &str = "scan://progress";
 pub const DISK_PROGRESS_EVENT: &str = "disk://progress";
 
 #[tauri::command]
+pub async fn inspect_app_storage(app: Browser) -> Result<Vec<DataItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || installed_apps::inspect_storage(app))
+        .await
+        .map_err(|e| format!("Application storage inspection failed: {e}"))?
+}
+
+#[tauri::command]
 pub async fn inspect_ai_data() -> Result<Vec<DataItem>, String> {
     tauri::async_runtime::spawn_blocking(ai_data::local_data)
         .await

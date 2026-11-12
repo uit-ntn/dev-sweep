@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { AiDataInspector } from "../components/AiDataInspector";
 import { Button, Card, Empty, Notice, PageHeader } from "../components/ui";
-import { inTauri, listInstalledApps, measureAppCache } from "../lib/api";
+import { inTauri, inspectAppStorage, listInstalledApps, measureAppCache } from "../lib/api";
 import { formatBytes } from "../lib/format";
-import type { AppCacheSize, AppInventory, InstalledApp, SupportedBrowser } from "../types";
+import type { AiDataItem, AppCacheSize, AppInventory, InstalledApp, SupportedBrowser } from "../types";
 
 function browserFor(app: InstalledApp): SupportedBrowser | undefined {
   if (app.name === "Google Chrome" && app.publisher.startsWith("Google ")) return "chrome";
@@ -20,6 +20,22 @@ export function InstalledApps() {
   const [measuring, setMeasuring] = useState<SupportedBrowser>();
   const [cacheError, setCacheError] = useState("");
   const cachePanel = useRef<HTMLDivElement>(null);
+  const [storage, setStorage] = useState<{ name: string; items: AiDataItem[] }>();
+  const [storageBusy, setStorageBusy] = useState(false);
+
+  async function inspectStorage(app: InstalledApp) {
+    setStorageBusy(true);
+    setCacheError("");
+    setStorage(undefined);
+    try {
+      const items = await inspectAppStorage(app.name.toLowerCase() === "postman" ? "postman" : "capcut");
+      setStorage({ name: app.name, items });
+    } catch (e) {
+      setCacheError(String(e));
+    } finally {
+      setStorageBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!inTauri()) return;
@@ -32,8 +48,8 @@ export function InstalledApps() {
   }, [refresh]);
 
   useEffect(() => {
-    if (cache || cacheError) cachePanel.current?.scrollIntoView({ block: "nearest" });
-  }, [cache, cacheError]);
+    if (cache || cacheError || storage) cachePanel.current?.scrollIntoView({ block: "nearest" });
+  }, [cache, cacheError, storage]);
 
   async function checkCache(browser: SupportedBrowser) {
     setMeasuring(browser);
@@ -71,8 +87,21 @@ export function InstalledApps() {
       {inTauri() && loading && <p role="status" className="text-sm text-muted">Reading installed apps…</p>}
       {error && <Notice tone="error">{error}</Notice>}
       {inventory?.warnings.map((warning) => <Notice key={warning} tone="warn">{warning}</Notice>)}
-      {(cache || cacheError) && (
+      {(cache || cacheError || storage) && (
         <div ref={cachePanel} aria-live="polite">
+          {storage && (
+            <Card className="space-y-3 p-4">
+              <h2 className="font-semibold">{storage.name} storage</h2>
+              <p className="text-sm text-muted">Known default locations. Review cache candidates in the application before clearing. Custom locations may require Disk Analyzer.</p>
+              {storage.items.length === 0 && <Empty>No recognized folders found at the default locations.</Empty>}
+              {storage.items.map((item) => (
+                <div key={item.path} className="border-t border-border py-2 text-sm">
+                  <div>{item.kind} · {formatBytes(item.bytes)}{item.incomplete && " · incomplete"}</div>
+                  <div className="break-all text-xs text-muted">{item.path}</div>
+                </div>
+              ))}
+            </Card>
+          )}
           {cacheError && <Notice tone="error">{cacheError}</Notice>}
           {cache && <Card className="space-y-3 p-4">
             <h2 className="font-semibold">{cache.browser === "chrome" ? "Google Chrome" : "Microsoft Edge"} cache</h2>
@@ -122,7 +151,11 @@ export function InstalledApps() {
                   return (
                     <tr key={JSON.stringify(app)} className="border-t border-border align-top">
                       <td className="break-words p-3">
-                        <div className="font-medium">{app.name}</div>
+                        {["postman", "capcut"].includes(app.name.toLowerCase()) ? (
+                          <button disabled={storageBusy} className="font-medium text-accent underline" onClick={() => void inspectStorage(app)}>
+                            {app.name} · Inspect storage
+                          </button>
+                        ) : <div className="font-medium">{app.name}</div>}
                         <div className="text-xs text-muted">
                           {[app.publisher, app.version].filter(Boolean).join(" · ")}
                         </div>
